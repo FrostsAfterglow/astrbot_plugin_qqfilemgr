@@ -6,6 +6,12 @@
     "default": "auto",
     "hint": "auto=优先 OneBot 群文件 API，不可用时回退本地镜像；onebot=强制走 QQ 群文件系统；local=仅本地目录镜像（适合离线测试/自托管）。"
   },
+  "ONEBOT_PLATFORM": {
+    "type": "string",
+    "description": "OneBot 适配器在 AstrBot 中注册的平台名（auto/onebot 模式生效）",
+    "default": "aiocqhttp",
+    "hint": "后端会自动依次尝试 aiocqhttp/onebot/qq 等常见平台名并兜底枚举已注册适配器；若你的平台名特殊，可在此显式指定。"
+  },
   "ENABLE_AUTO_CLASSIFY": {
     "type": "bool",
     "description": "是否启用定时自动归类（按扩展名位移文件到分类目录）",

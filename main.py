@@ -90,12 +90,33 @@ class QQFileManagerPlugin(Star):
     # ---------- 后端构建 ----------
     def _build_backend(self) -> FileBackend:
         mode = str(self.config.get("BACKEND", "auto") or "auto").lower()
+        ob_platform = str(self.config.get("ONEBOT_PLATFORM", "aiocqhttp") or "aiocqhttp")
         if mode == "local":
             return LocalBackend(self.local_base)
         if mode == "onebot":
-            return OneBotFileBackend(self.context, platform="aiocqhttp")
+            return OneBotFileBackend(self.context, platform=ob_platform)
         # auto：优先 OneBot；若需离线测试可改为 local
-        return OneBotFileBackend(self.context, platform="aiocqhttp")
+        return OneBotFileBackend(self.context, platform=ob_platform)
+
+    # ---------- 指令容错包装 ----------
+    async def _safe_yield(self, event, gen):
+        """包装 handler 生成器：捕获后端 RuntimeError，转为友好提示而非崩溃。"""
+        try:
+            async for r in gen:
+                yield r
+        except RuntimeError as e:
+            msg = str(e)
+            if "适配器" in msg or "BACKEND" in msg or "local" in msg:
+                yield event.plain_result(
+                    "⚠️ 无法连接 QQ 群文件后端。\n"
+                    "若你尚未接入支持群文件系统的 QQ 适配器（gocqhttp / Lagrange），\n"
+                    "请在插件配置中将 BACKEND 设为 local 进行离线测试；\n"
+                    "若已接入，请确认适配器在线（默认尝试 aiocqhttp / onebot / qq 等平台名），\n"
+                    "或在配置 ONEBOT_PLATFORM 中指定你的平台名。\n"
+                    "（后端详情：" + msg + "）"
+                )
+            else:
+                yield event.plain_result("❌ 操作失败：" + msg)
 
     # ---------- 后台定时维护 ----------
     def _start_auto_maintenance(self):
@@ -132,41 +153,41 @@ class QQFileManagerPlugin(Star):
     # ---------- 指令：帮助 ----------
     @filter.command(CMD_HELP, "QQ群文件管理帮助")
     async def cmd_help(self, event: AstrMessageEvent):
-        async for r in self.file_handlers.handle_help(event):
+        async for r in self._safe_yield(event, self.file_handlers.handle_help(event)):
             yield r
 
     # ---------- 指令：列表 ----------
     @filter.command(CMD_LIST, "查看群文件列表")
     async def cmd_list(self, event: AstrMessageEvent, folder: str = ""):
-        async for r in self.file_handlers.handle_list(event, folder):
+        async for r in self._safe_yield(event, self.file_handlers.handle_list(event, folder)):
             yield r
 
     # ---------- 指令：归类 ----------
     @filter.command(CMD_CLASSIFY, "自动位移文件归类")
     async def cmd_classify(self, event: AstrMessageEvent):
-        async for r in self.file_handlers.handle_classify(event):
+        async for r in self._safe_yield(event, self.file_handlers.handle_classify(event)):
             yield r
 
     # ---------- 指令：清理失效文件 ----------
     @filter.command(CMD_CLEAN, "清理已失效文件")
     async def cmd_clean(self, event: AstrMessageEvent):
-        async for r in self.file_handlers.handle_clean(event):
+        async for r in self._safe_yield(event, self.file_handlers.handle_clean(event)):
             yield r
 
     # ---------- 指令：永久保存 ----------
     @filter.command(CMD_PERM, "将群文件转为永久保存")
     async def cmd_perm(self, event: AstrMessageEvent):
-        async for r in self.file_handlers.handle_perm(event):
+        async for r in self._safe_yield(event, self.file_handlers.handle_perm(event)):
             yield r
 
     # ---------- 指令：永久文件列表 ----------
     @filter.command(CMD_PERM_LIST, "查看永久保存清单")
     async def cmd_perm_list(self, event: AstrMessageEvent):
-        async for r in self.file_handlers.handle_perm_list(event):
+        async for r in self._safe_yield(event, self.file_handlers.handle_perm_list(event)):
             yield r
 
     # ---------- 指令：配置 ----------
     @filter.command(CMD_CONFIG, "查看文件管理配置")
     async def cmd_config(self, event: AstrMessageEvent):
-        async for r in self.file_handlers.handle_config(event):
+        async for r in self._safe_yield(event, self.file_handlers.handle_config(event)):
             yield r

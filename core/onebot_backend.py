@@ -15,28 +15,89 @@ from typing import List, Optional
 
 from .file_backend import FileBackend, FileNode
 
+# 常见 OneBot / QQ 适配器平台名，按顺序尝试（首个可取到的即绑定）。
+# AstrBot 不同版本/不同适配器注册的平台名不同，这里尽量兼容。
+PLATFORM_CANDIDATES = ["aiocqhttp", "onebot", "qq", "qq_official", "qqbot"]
+
 
 class OneBotFileBackend(FileBackend):
     def __init__(self, context, platform: str = "aiocqhttp"):
         self.context = context
         self.platform = platform
         self._adapter = None
+        self._resolved_platform = ""
+        self._tried_platforms: List[str] = []
 
     # ---------- 适配器与原始 action 调用 ----------
+    def _try_get(self, plat: str):
+        fn = getattr(self.context, "get_platform_adapter", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn(plat)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _probe(adapter) -> bool:
+        """判断一个对象是否像是可调 action 的适配器。"""
+        if adapter is None:
+            return False
+        if any(callable(getattr(adapter, m, None)) for m in ("call_action", "_call_action")):
+            return True
+        return bool(callable(adapter))
+
+    def _try_enumerate(self):
+        """兜底：遍历所有已注册适配器，取第一个可调用的。"""
+        for name in ("get_all_adapters", "get_platform_adapters", "get_adapters"):
+            fn = getattr(self.context, name, None)
+            if callable(fn):
+                try:
+                    items = fn()
+                    if isinstance(items, dict):
+                        items = items.values()
+                    for ad in (items or []):
+                        if self._probe(ad):
+                            return ad
+                except Exception:
+                    continue
+        # 内部属性兜底（部分 AstrBot 版本）
+        adapters = getattr(self.context, "_platform_adapters", None)
+        if isinstance(adapters, dict):
+            for ad in adapters.values():
+                if self._probe(ad):
+                    return ad
+        return None
+
     async def _get_adapter(self):
-        if self._adapter is None:
-            try:
-                self._adapter = self.context.get_platform_adapter(self.platform)
-            except Exception:
-                self._adapter = None
-        return self._adapter
+        if self._adapter is not None:
+            return self._adapter
+        candidates = [self.platform] + [p for p in PLATFORM_CANDIDATES if p != self.platform]
+        self._tried_platforms = []
+        for plat in candidates:
+            self._tried_platforms.append(plat)
+            adapter = self._try_get(plat)
+            if self._probe(adapter):
+                self._adapter = adapter
+                self._resolved_platform = plat
+                return self._adapter
+        # 兜底枚举
+        enumerated = self._try_enumerate()
+        if self._probe(enumerated):
+            self._adapter = enumerated
+            self._resolved_platform = "(enumerated)"
+            return self._adapter
+        return None
 
     async def _call(self, action: str, **params):
         adapter = await self._get_adapter()
         if adapter is None:
+            tried = ", ".join(self._tried_platforms or [self.platform])
             raise RuntimeError(
-                "无法获取 OneBot 适配器，请确认已接入支持群文件系统的 QQ 适配器"
-                "（如 gocqhttp / Lagrange），且平台名为 " + self.platform
+                "无法获取 QQ 群文件适配器。已尝试平台：" + tried +
+                "。请确认：1) 已接入支持群文件系统的 QQ 适配器（gocqhttp / Lagrange 等）且在线；"
+                "2) 若仅离线测试，可在插件配置中将 BACKEND 设为 local；"
+                "3) 若平台名特殊，可在配置 ONEBOT_PLATFORM 中指定。"
             )
         # 兼容不同 AstrBot 版本暴露的原始 action 调用方式
         for meth in ("call_action", "_call_action"):

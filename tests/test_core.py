@@ -21,6 +21,7 @@ if PLUGIN_ROOT not in sys.path:
 from core.classifier import Classifier  # noqa: E402
 from core.local_backend import LocalBackend  # noqa: E402
 from core.file_manager import FileManager, human_size, sha256_of_file  # noqa: E402
+from core.onebot_backend import OneBotFileBackend  # noqa: E402
 from data.database import FileDB  # noqa: E402
 
 
@@ -186,6 +187,51 @@ class TestHelpers(unittest.TestCase):
             f.write("abc")
         self.assertEqual(len(sha256_of_file(p)), 64)
         os.remove(p)
+
+
+class _FakeAdapter:
+    def call_action(self, action, **kw):
+        return {"ok": True, "echo": action}
+
+
+class _FakeContext:
+    def __init__(self, adapters: dict):
+        self._adapters = adapters
+
+    def get_platform_adapter(self, plat):
+        return self._adapters.get(plat)
+
+
+class TestOneBotDiscovery(unittest.TestCase):
+    def test_finds_adapter_on_named_platform(self):
+        ctx = _FakeContext({"aiocqhttp": _FakeAdapter()})
+        be = OneBotFileBackend(ctx, platform="aiocqhttp")
+        ad = run(be._get_adapter())
+        self.assertIsNotNone(ad)
+        self.assertEqual(be._resolved_platform, "aiocqhttp")
+
+    def test_falls_back_to_other_platform_name(self):
+        # 用户平台名是 qq 而非默认 aiocqhttp，应能自动发现
+        ctx = _FakeContext({"qq": _FakeAdapter()})
+        be = OneBotFileBackend(ctx, platform="aiocqhttp")
+        ad = run(be._get_adapter())
+        self.assertIsNotNone(ad)
+        self.assertEqual(be._resolved_platform, "qq")
+
+    def test_enumerate_when_only_internal_dict(self):
+        ctx = _FakeContext({})
+        ctx._platform_adapters = {"whatever": _FakeAdapter()}
+        be = OneBotFileBackend(ctx, platform="aiocqhttp")
+        ad = run(be._get_adapter())
+        self.assertIsNotNone(ad)
+
+    def test_no_adapter_returns_none(self):
+        ctx = _FakeContext({})
+        be = OneBotFileBackend(ctx, platform="aiocqhttp")
+        ad = run(be._get_adapter())
+        self.assertIsNone(ad)
+        with self.assertRaises(RuntimeError):
+            run(be._call("get_group_root_files", group_id=100))
 
 
 if __name__ == "__main__":

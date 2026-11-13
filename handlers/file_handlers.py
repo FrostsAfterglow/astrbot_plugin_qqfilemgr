@@ -54,7 +54,7 @@ class FileHandlers:
     # ---------- 帮助 ----------
     async def handle_help(self, event: AstrMessageEvent):
         text = (
-            "📂 QQ群聊文件管理 v1.0.0 指令\n"
+            "📂 QQ群聊文件管理 v1.0.1 指令\n"
             "━━━━━━━━━━━━━━━━\n"
             "  群文件列表 [文件夹]\n"
             "    └─ 查看群文件系统的文件/文件夹\n"
