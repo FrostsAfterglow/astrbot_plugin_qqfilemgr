@@ -1,0 +1,63 @@
+{
+  "BACKEND": {
+    "type": "string",
+    "description": "文件后端类型",
+    "options": ["auto", "onebot", "local"],
+    "default": "auto",
+    "hint": "auto=优先 OneBot 群文件 API，不可用时回退本地镜像；onebot=强制走 QQ 群文件系统；local=仅本地目录镜像（适合离线测试/自托管）。"
+  },
+  "ENABLE_AUTO_CLASSIFY": {
+    "type": "bool",
+    "description": "是否启用定时自动归类（按扩展名位移文件到分类目录）",
+    "default": false,
+    "hint": "开启后按 AUTO_MAINTENANCE_INTERVAL 周期扫描并归类。"
+  },
+  "ENABLE_AUTO_CLEAN": {
+    "type": "bool",
+    "description": "是否启用定时自动清理已失效文件",
+    "default": false,
+    "hint": "开启后按周期扫描，删除无法访问的失效文件（受 DRY_RUN_DEFAULT 保护）。"
+  },
+  "AUTO_MAINTENANCE_INTERVAL": {
+    "type": "int",
+    "description": "定时维护间隔（分钟）",
+    "default": 360,
+    "hint": "自动归类/清理的执行周期，建议不小于 60。"
+  },
+  "DRY_RUN_DEFAULT": {
+    "type": "bool",
+    "description": "清理/归类指令默认试运行（只报告不执行）",
+    "default": true,
+    "hint": "为安全起见默认开启；指令加 --force 才会真正落盘改动。"
+  },
+  "ENABLE_PERMANENT_UPLOAD": {
+    "type": "bool",
+    "description": "永久保存时是否同时回传到群文件系统的「永久保存」目录",
+    "default": false,
+    "hint": "开启后，下载的本地副本会再上传到群文件里名为 PERMANENT_UPLOAD_FOLDER 的目录，实现双保险。"
+  },
+  "PERMANENT_UPLOAD_FOLDER": {
+    "type": "string",
+    "description": "永久保存回传目录名（群文件系统内）",
+    "default": "永久保存",
+    "hint": "仅在 ENABLE_PERMANENT_UPLOAD=true 且后端为 onebot 时生效。"
+  },
+  "MAX_PERMANENT_SIZE_MB": {
+    "type": "int",
+    "description": "单文件永久保存大小上限（MB），超过则跳过",
+    "default": 200,
+    "hint": "防止大文件占满磁盘，0 表示不限制。"
+  },
+  "GROUP_WHITELIST": {
+    "type": "list",
+    "description": "允许管理的群号白名单（字符串）",
+    "default": [],
+    "hint": "为空表示对所有群生效；填写后仅列表内的群可被执行维护。"
+  },
+  "ADMINS": {
+    "type": "list",
+    "description": "可执行维护指令的管理员用户ID（字符串）",
+    "default": [],
+    "hint": "为空表示仅插件管理员（AstrBot 内置权限）可操作。"
+  }
+}

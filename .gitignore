@@ -1,0 +1,15 @@
+# 运行时文件（非源码，勿提交）
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 插件数据目录（永久存档、本地镜像、数据库），运行时生成
+data/group_files/
+data/permanent/
+data/*.db
+data/plugin_data/
+
+# AstrBot 框架运行期文件（非插件源码）
+data/cmd_config.json
+data/t2i_templates/
