@@ -190,8 +190,24 @@ class TestHelpers(unittest.TestCase):
 
 
 class _FakeAdapter:
+    """同步版 call_action。"""
+
     def call_action(self, action, **kw):
         return {"ok": True, "echo": action}
+
+
+class _AsyncAdapter:
+    """异步版 call_action（真实 AstrBot 适配器多为 async）。"""
+
+    async def call_action(self, action, **kw):
+        return {"ok": True, "echo": action}
+
+
+class _WrappedAdapter:
+    """action 方法挂在 bot 子对象上。"""
+
+    def __init__(self):
+        self.bot = _FakeAdapter()
 
 
 class _FakeContext:
@@ -225,6 +241,17 @@ class TestOneBotDiscovery(unittest.TestCase):
         ad = run(be._get_adapter())
         self.assertIsNotNone(ad)
 
+    def test_get_platform_adapters_dict(self):
+        # 通过 get_platform_adapters() 返回 dict 的场景
+        class Ctx(_FakeContext):
+            def get_platform_adapters(self):
+                return {"onebot": _AsyncAdapter()}
+
+        be = OneBotFileBackend(Ctx({}), platform="aiocqhttp")
+        info = be.diagnose()
+        self.assertIn("onebot", info["platforms"])
+        self.assertTrue(info["details"]["onebot"]["usable"])
+
     def test_no_adapter_returns_none(self):
         ctx = _FakeContext({})
         be = OneBotFileBackend(ctx, platform="aiocqhttp")
@@ -232,6 +259,32 @@ class TestOneBotDiscovery(unittest.TestCase):
         self.assertIsNone(ad)
         with self.assertRaises(RuntimeError):
             run(be._call("get_group_root_files", group_id=100))
+
+    def test_call_sync_action(self):
+        ctx = _FakeContext({"aiocqhttp": _FakeAdapter()})
+        be = OneBotFileBackend(ctx, platform="aiocqhttp")
+        r = run(be._call("get_group_root_files", group_id=100))
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["echo"], "get_group_root_files")
+
+    def test_call_async_action(self):
+        ctx = _FakeContext({"onebot": _AsyncAdapter()})
+        be = OneBotFileBackend(ctx, platform="aiocqhttp")
+        r = run(be._call("get_group_root_files", group_id=100))
+        self.assertTrue(r["ok"])
+
+    def test_call_via_bot_wrapper(self):
+        ctx = _FakeContext({"qq": _WrappedAdapter()})
+        be = OneBotFileBackend(ctx, platform="aiocqhttp")
+        r = run(be._call("get_group_root_files", group_id=100))
+        self.assertTrue(r["ok"])
+
+    def test_diagnose_empty(self):
+        ctx = _FakeContext({})
+        be = OneBotFileBackend(ctx, platform="aiocqhttp")
+        info = be.diagnose()
+        self.assertEqual(info["platforms"], [])
+        self.assertEqual(info["details"], {})
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ name: astrbot_plugin_qqfilemgr
 display_name: QQ群聊文件管理
 desc: 自动位移文件归类、清理已失效文件、将群文件转为永久保存（本地存档 + 可选回传群文件系统的「永久保存」目录），并支持定时自动维护。
 short_desc: QQ 群文件自动归类 / 失效清理 / 永久存档
-version: v1.0.1
+version: v1.0.2
 author: FrostsAfterglow
 repo: https://github.com/FrostsAfterglow/astrbot_plugin_qqfilemgr
 astrbot_version: ">=4.16,<5"

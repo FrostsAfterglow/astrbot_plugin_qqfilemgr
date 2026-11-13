@@ -32,13 +32,14 @@ CMD_CLEAN = "清理失效文件"
 CMD_PERM = "永久保存"
 CMD_PERM_LIST = "永久文件列表"
 CMD_CONFIG = "文件管理配置"
+CMD_DIAG = "群文件诊断"
 
 
 @register(
     "astrbot_plugin_qqfilemgr",
     "FrostsAfterglow",
     "QQ群聊文件管理：自动归类 / 失效清理 / 永久保存",
-    "1.0.0",
+    "1.0.2",
     "https://github.com/FrostsAfterglow/astrbot_plugin_qqfilemgr",
 )
 class QQFileManagerPlugin(Star):
@@ -191,3 +192,31 @@ class QQFileManagerPlugin(Star):
     async def cmd_config(self, event: AstrMessageEvent):
         async for r in self._safe_yield(event, self.file_handlers.handle_config(event)):
             yield r
+
+    # ---------- 指令：诊断 ----------
+    @filter.command(CMD_DIAG, "诊断 QQ 群文件后端")
+    async def cmd_diag(self, event: AstrMessageEvent):
+        backend_mode = str(self.config.get("BACKEND", "auto") or "auto")
+        lines = [f"🔧 群文件后端诊断（BACKEND={backend_mode}）"]
+        diag = getattr(self.backend, "diagnose", None)
+        if callable(diag):
+            try:
+                info = diag()
+            except Exception as e:  # noqa
+                info = {"error": str(e)}
+            plats = info.get("platforms", [])
+            lines.append(f"已注册平台({len(plats)}): {', '.join(plats) or '(无)'}")
+            for plat, d in (info.get("details", {}) or {}).items():
+                lines.append(
+                    f"  · {plat}: type={d.get('type')} 可用={d.get('usable')} "
+                    f"方法={d.get('methods')} 包装={d.get('wrapper_methods')}"
+                )
+            if not plats:
+                lines.append("未枚举到任何平台适配器。可能原因：")
+                lines.append("  1) 当前 AstrBot 版本取适配器的接口不同；")
+                lines.append("  2) 尚未接入 QQ 适配器（gocqhttp/Lagrange）；")
+                lines.append("  3) 适配器未在线。")
+                lines.append("若仅想试用功能，请把 BACKEND 设为 local。")
+        else:
+            lines.append("当前后端为本地镜像（local），不涉及 QQ 适配器。")
+        yield event.plain_result("\n".join(lines))

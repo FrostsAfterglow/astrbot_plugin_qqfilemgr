@@ -21,6 +21,11 @@ PLATFORM_CANDIDATES = ["aiocqhttp", "onebot", "qq", "qq_official", "qqbot"]
 
 
 class OneBotFileBackend(FileBackend):
+    # 调用原始 action 时尝试的方法名（不同 AstrBot 版本/适配器命名不同）
+    ACTION_METHODS = ("call_action", "_call_action", "send_action", "send")
+    # 适配器上可能包裹 bot/client 的属性，action 方法挂在它们上面
+    WRAPPER_ATTRS = ("bot", "client", "http", "api")
+
     def __init__(self, context, platform: str = "aiocqhttp"):
         self.context = context
         self.platform = platform
@@ -29,7 +34,8 @@ class OneBotFileBackend(FileBackend):
         self._tried_platforms: List[str] = []
 
     # ---------- 适配器与原始 action 调用 ----------
-    def _try_get(self, plat: str):
+    def _get_one(self, plat: str):
+        """通过 context.get_platform_adapter(plat) 取单个适配器（兼容方法缺失）。"""
         fn = getattr(self.context, "get_platform_adapter", None)
         if not callable(fn):
             return None
@@ -38,75 +44,137 @@ class OneBotFileBackend(FileBackend):
         except Exception:
             return None
 
+    def _discover_all(self) -> dict:
+        """尽可能全面地枚举当前已注册的所有平台适配器。
+
+        兼容多种 AstrBot 版本暴露适配器注册表的方式：
+          - context.get_platform_adapters()  (返回 dict 或 list)
+          - context.get_all_adapters() / get_adapters()
+          - context.platform_adapters / _platform_adapters (内部 dict)
+        返回 {平台名: 适配器对象}。
+        """
+        found: dict = {}
+        # 1) 多取值函数
+        for name in ("get_platform_adapters", "get_all_adapters", "get_adapters"):
+            fn = getattr(self.context, name, None)
+            if not callable(fn):
+                continue
+            try:
+                res = fn()
+            except Exception:
+                continue
+            if isinstance(res, dict):
+                found.update(res)
+            elif isinstance(res, (list, tuple)):
+                for a in res:
+                    nm = getattr(a, "platform", None) or getattr(a, "platform_name", None)
+                    if nm:
+                        found[str(nm)] = a
+        # 2) 内部属性（dict）
+        for attr in ("platform_adapters", "_platform_adapters", "adapters"):
+            reg = getattr(self.context, attr, None)
+            if isinstance(reg, dict):
+                found.update(reg)
+        # 3) 单平台取（配置的 + 常见候选），补全
+        for plat in [self.platform] + [p for p in PLATFORM_CANDIDATES if p != self.platform]:
+            if plat in found:
+                continue
+            ad = self._get_one(plat)
+            if ad is not None:
+                found[plat] = ad
+        return found
+
     @staticmethod
-    def _probe(adapter) -> bool:
-        """判断一个对象是否像是可调 action 的适配器。"""
+    def _has_action(adapter) -> bool:
+        """对象（或它的 bot/client 包装）是否具备某种 action 调用方法。"""
         if adapter is None:
             return False
-        if any(callable(getattr(adapter, m, None)) for m in ("call_action", "_call_action")):
-            return True
-        return bool(callable(adapter))
+        for meth in OneBotFileBackend.ACTION_METHODS:
+            if callable(getattr(adapter, meth, None)):
+                return True
+        for attr in OneBotFileBackend.WRAPPER_ATTRS:
+            sub = getattr(adapter, attr, None)
+            if sub is not None and any(
+                callable(getattr(sub, m, None)) for m in OneBotFileBackend.ACTION_METHODS
+            ):
+                return True
+        return False
 
-    def _try_enumerate(self):
-        """兜底：遍历所有已注册适配器，取第一个可调用的。"""
-        for name in ("get_all_adapters", "get_platform_adapters", "get_adapters"):
-            fn = getattr(self.context, name, None)
+    def _invoke(self, adapter, action: str, **params):
+        """对某个适配器尝试多种调用姿势，成功返回结果。"""
+        if adapter is None:
+            raise RuntimeError("adapter is None")
+        # 直接方法
+        for meth in self.ACTION_METHODS:
+            fn = getattr(adapter, meth, None)
             if callable(fn):
-                try:
-                    items = fn()
-                    if isinstance(items, dict):
-                        items = items.values()
-                    for ad in (items or []):
-                        if self._probe(ad):
-                            return ad
-                except Exception:
-                    continue
-        # 内部属性兜底（部分 AstrBot 版本）
-        adapters = getattr(self.context, "_platform_adapters", None)
-        if isinstance(adapters, dict):
-            for ad in adapters.values():
-                if self._probe(ad):
-                    return ad
-        return None
+                return fn(action, **params)
+        # 经 bot / client 包装
+        for attr in self.WRAPPER_ATTRS:
+            sub = getattr(adapter, attr, None)
+            if sub is None:
+                continue
+            for meth in self.ACTION_METHODS:
+                fn = getattr(sub, meth, None)
+                if callable(fn):
+                    return fn(action, **params)
+        if callable(adapter):
+            return adapter(action, **params)
+        raise RuntimeError("适配器无可用 action 调用方法")
+
+    def diagnose(self) -> dict:
+        """侦察：列出实际可用的平台名，以及每个适配器暴露的 action 方法。"""
+        found = self._discover_all()
+        details = {}
+        for plat, adapter in found.items():
+            methods = [m for m in self.ACTION_METHODS if callable(getattr(adapter, m, None))]
+            sub_methods: dict = {}
+            for attr in self.WRAPPER_ATTRS:
+                sub = getattr(adapter, attr, None)
+                if sub is not None:
+                    sm = [m for m in self.ACTION_METHODS if callable(getattr(sub, m, None))]
+                    if sm:
+                        sub_methods[attr] = sm
+            details[str(plat)] = {
+                "type": type(adapter).__name__,
+                "methods": methods,
+                "wrapper_methods": sub_methods,
+                "usable": bool(methods or sub_methods),
+            }
+        return {"platforms": list(found.keys()), "details": details}
 
     async def _get_adapter(self):
         if self._adapter is not None:
             return self._adapter
-        candidates = [self.platform] + [p for p in PLATFORM_CANDIDATES if p != self.platform]
-        self._tried_platforms = []
-        for plat in candidates:
-            self._tried_platforms.append(plat)
-            adapter = self._try_get(plat)
-            if self._probe(adapter):
+        found = self._discover_all()
+        for plat, adapter in found.items():
+            if self._has_action(adapter):
                 self._adapter = adapter
                 self._resolved_platform = plat
                 return self._adapter
-        # 兜底枚举
-        enumerated = self._try_enumerate()
-        if self._probe(enumerated):
-            self._adapter = enumerated
-            self._resolved_platform = "(enumerated)"
-            return self._adapter
         return None
 
     async def _call(self, action: str, **params):
-        adapter = await self._get_adapter()
-        if adapter is None:
-            tried = ", ".join(self._tried_platforms or [self.platform])
-            raise RuntimeError(
-                "无法获取 QQ 群文件适配器。已尝试平台：" + tried +
-                "。请确认：1) 已接入支持群文件系统的 QQ 适配器（gocqhttp / Lagrange 等）且在线；"
-                "2) 若仅离线测试，可在插件配置中将 BACKEND 设为 local；"
-                "3) 若平台名特殊，可在配置 ONEBOT_PLATFORM 中指定。"
-            )
-        # 兼容不同 AstrBot 版本暴露的原始 action 调用方式
-        for meth in ("call_action", "_call_action"):
-            fn = getattr(adapter, meth, None)
-            if callable(fn):
-                return await fn(action, **params)
-        if callable(adapter):
-            return await adapter(action, **params)
-        raise RuntimeError("适配器不支持原始 action 调用（call_action / _call_action）。")
+        import inspect
+
+        found = self._discover_all()
+        for plat, adapter in found.items():
+            try:
+                result = self._invoke(adapter, action, **params)
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
+            except Exception:  # 该适配器调不动，换下一个
+                continue
+        # 仍失败：给出诊断信息，便于定位
+        diag = self.diagnose()
+        plat_line = ", ".join(diag["platforms"] or ["(无)"])
+        raise RuntimeError(
+            "无法获取/调用 QQ 群文件适配器。已注册平台：" + plat_line +
+            "。请确认：1) 已接入支持群文件系统的 QQ 适配器（gocqhttp / Lagrange 等）且在线；"
+            "2) 若仅离线测试，可在插件配置中将 BACKEND 设为 local；"
+            "3) 若平台名特殊，可在配置 ONEBOT_PLATFORM 中指定。（细节：" + str(diag["details"]) + "）"
+        )
 
     # ---------- 读取 ----------
     async def list_files(self, group_id: str, folder_id: str = "") -> List[FileNode]:
