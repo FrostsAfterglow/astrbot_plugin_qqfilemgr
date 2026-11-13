@@ -4,13 +4,13 @@
     "description": "文件后端类型",
     "options": ["auto", "onebot", "local"],
     "default": "auto",
-    "hint": "auto=优先 OneBot 群文件 API，不可用时回退本地镜像；onebot=强制走 QQ 群文件系统；local=仅本地目录镜像（适合离线测试/自托管）。"
+    "hint": "auto=优先用 event.bot 调 OneBot 群文件 API，绑定不到自动降级本地镜像；onebot=强制走 QQ 群文件系统（不降级）；local=仅本地目录镜像（离线测试/自托管）。"
   },
   "ONEBOT_PLATFORM": {
     "type": "string",
-    "description": "OneBot 适配器在 AstrBot 中注册的平台名（auto/onebot 模式生效）",
+    "description": "OneBot 适配器平台标识（一般无需修改）",
     "default": "aiocqhttp",
-    "hint": "后端会自动依次尝试 aiocqhttp/onebot/qq 等常见平台名并兜底枚举已注册适配器；若你的平台名特殊，可在此显式指定。"
+    "hint": "插件优先从每条消息的 event.bot 直接取 OneBot 客户端；此值仅作为后台定时任务通过 context 绑定时的参考，通常保持默认即可。"
   },
   "ENABLE_AUTO_CLASSIFY": {
     "type": "bool",

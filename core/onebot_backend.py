@@ -1,199 +1,186 @@
-"""OneBot v11 群文件系统后端（最佳努力 / 防御式）。
+"""OneBot v11 群文件系统后端（基于 event.bot.api.call_action）。
 
-调用 gocqhttp / Lagrange 等支持群文件系统的适配器提供的原始 action：
-    get_group_root_files / get_group_files_by_folder
-    get_group_file_url / upload_group_file
-    create_group_file_folder / delete_group_file / move_group_file
+关键：AstrBot 插件里调用原始 OneBot action 的正确姿势不是
+``context.get_platform_adapter(字符串)``，而是：
+  - 每条消息事件 ``event.bot`` 即 aiocqhttp 客户端，具备 ``.api.call_action``；
+  - 或 ``context.get_platform(filter.PlatformAdapterType.AIOCQHTTP).get_client()``。
+本后端同时支持两者：指令触发时用 event 绑定，后台任务用 context 绑定。
 
-AstrBot 的 Star 上下文通过 ``context.get_platform_adapter(platform)`` 取得适配器，
-不同版本暴露原始 action 调用的方法名不同，这里做多重兼容尝试并全程防御，
-任何失败都会抛出清晰的 RuntimeError（由上层捕获并提示用户检查适配器）。
+参考实现：https://github.com/Foolllll-J/astrbot_plugin_GroupFS
 """
 
+import os
 import time
 from typing import List, Optional
 
 from .file_backend import FileBackend, FileNode
 
-# 常见 OneBot / QQ 适配器平台名，按顺序尝试（首个可取到的即绑定）。
-# AstrBot 不同版本/不同适配器注册的平台名不同，这里尽量兼容。
-PLATFORM_CANDIDATES = ["aiocqhttp", "onebot", "qq", "qq_official", "qqbot"]
+
+def _normalize(result) -> dict:
+    """兼容 OneBot 返回值被 {'data': {...}} 包裹的情况（部分协议端如此）。"""
+    if isinstance(result, dict) and isinstance(result.get("data"), dict):
+        return result.get("data", {})
+    return result if isinstance(result, dict) else {}
 
 
 class OneBotFileBackend(FileBackend):
-    # 调用原始 action 时尝试的方法名（不同 AstrBot 版本/适配器命名不同）
-    ACTION_METHODS = ("call_action", "_call_action", "send_action", "send")
-    # 适配器上可能包裹 bot/client 的属性，action 方法挂在它们上面
-    WRAPPER_ATTRS = ("bot", "client", "http", "api")
-
     def __init__(self, context, platform: str = "aiocqhttp"):
         self.context = context
         self.platform = platform
-        self._adapter = None
-        self._resolved_platform = ""
-        self._tried_platforms: List[str] = []
+        self._bot = None                 # aiocqhttp 客户端，具备 .api.call_action
+        self._bound_from = ""            # 绑定来源，供诊断
+        self._last_error = ""            # 最近一次绑定错误，供诊断
+        self._is_llbot = False           # LLOneBot / SnowLuma 参数略有差异
+        self._app_name = ""
+        self._detected = False
+        self.bind_from_context()
 
-    # ---------- 适配器与原始 action 调用 ----------
-    def _get_one(self, plat: str):
-        """通过 context.get_platform_adapter(plat) 取单个适配器（兼容方法缺失）。"""
-        fn = getattr(self.context, "get_platform_adapter", None)
-        if not callable(fn):
-            return None
-        try:
-            return fn(plat)
-        except Exception:
-            return None
-
-    def _discover_all(self) -> dict:
-        """尽可能全面地枚举当前已注册的所有平台适配器。
-
-        兼容多种 AstrBot 版本暴露适配器注册表的方式：
-          - context.get_platform_adapters()  (返回 dict 或 list)
-          - context.get_all_adapters() / get_adapters()
-          - context.platform_adapters / _platform_adapters (内部 dict)
-        返回 {平台名: 适配器对象}。
-        """
-        found: dict = {}
-        # 1) 多取值函数
-        for name in ("get_platform_adapters", "get_all_adapters", "get_adapters"):
-            fn = getattr(self.context, name, None)
-            if not callable(fn):
-                continue
-            try:
-                res = fn()
-            except Exception:
-                continue
-            if isinstance(res, dict):
-                found.update(res)
-            elif isinstance(res, (list, tuple)):
-                for a in res:
-                    nm = getattr(a, "platform", None) or getattr(a, "platform_name", None)
-                    if nm:
-                        found[str(nm)] = a
-        # 2) 内部属性（dict）
-        for attr in ("platform_adapters", "_platform_adapters", "adapters"):
-            reg = getattr(self.context, attr, None)
-            if isinstance(reg, dict):
-                found.update(reg)
-        # 3) 单平台取（配置的 + 常见候选），补全
-        for plat in [self.platform] + [p for p in PLATFORM_CANDIDATES if p != self.platform]:
-            if plat in found:
-                continue
-            ad = self._get_one(plat)
-            if ad is not None:
-                found[plat] = ad
-        return found
-
+    # ---------- 绑定 OneBot 客户端 ----------
     @staticmethod
-    def _has_action(adapter) -> bool:
-        """对象（或它的 bot/client 包装）是否具备某种 action 调用方法。"""
-        if adapter is None:
-            return False
-        for meth in OneBotFileBackend.ACTION_METHODS:
-            if callable(getattr(adapter, meth, None)):
-                return True
-        for attr in OneBotFileBackend.WRAPPER_ATTRS:
-            sub = getattr(adapter, attr, None)
-            if sub is not None and any(
-                callable(getattr(sub, m, None)) for m in OneBotFileBackend.ACTION_METHODS
-            ):
-                return True
+    def _valid(client) -> bool:
+        """参考插件 _is_supported_bot_client：需具备 .api.call_action。"""
+        return bool(
+            client
+            and hasattr(client, "api")
+            and hasattr(client.api, "call_action")
+        )
+
+    def bind_event(self, event) -> bool:
+        """从消息事件绑定（最可靠：能进消息说明 bot 一定在线）。"""
+        cand = getattr(event, "bot", None)
+        if self._valid(cand):
+            if cand is not self._bot:
+                self._bot = cand
+                self._detected = False
+            self._bound_from = "event.bot"
+            return True
         return False
 
-    def _invoke(self, adapter, action: str, **params):
-        """对某个适配器尝试多种调用姿势，成功返回结果。"""
-        if adapter is None:
-            raise RuntimeError("adapter is None")
-        # 直接方法
-        for meth in self.ACTION_METHODS:
-            fn = getattr(adapter, meth, None)
-            if callable(fn):
-                return fn(action, **params)
-        # 经 bot / client 包装
-        for attr in self.WRAPPER_ATTRS:
-            sub = getattr(adapter, attr, None)
-            if sub is None:
-                continue
-            for meth in self.ACTION_METHODS:
-                fn = getattr(sub, meth, None)
-                if callable(fn):
-                    return fn(action, **params)
-        if callable(adapter):
-            return adapter(action, **params)
-        raise RuntimeError("适配器无可用 action 调用方法")
+    def bind_from_context(self) -> bool:
+        """后台任务（无 event）时用 context 的 platform manager 绑定。"""
+        if self._valid(self._bot):
+            return True
+        try:
+            from astrbot.api.event import filter as _af
+            ptype = getattr(getattr(_af, "PlatformAdapterType", None), "AIOCQHTTP", None)
+            getter = getattr(self.context, "get_platform", None)
+            if callable(getter) and ptype is not None:
+                plat = getter(ptype)
+                client = plat.get_client() if hasattr(plat, "get_client") else None
+                if self._valid(client):
+                    self._bot = client
+                    self._detected = False
+                    self._bound_from = "context.get_platform(AIOCQHTTP).get_client()"
+                    return True
+        except Exception as e:  # 离线/版本差异时静默，交由 event 绑定
+            self._last_error = "get_platform: " + str(e)
+        return False
+
+    async def ensure_ready(self, event=None) -> bool:
+        """指令执行前调用：绑定 bot 并探测协议端类型。"""
+        if event is not None:
+            self.bind_event(event)
+        self.bind_from_context()
+        if not self._valid(self._bot):
+            return False
+        if not self._detected:
+            try:
+                info = _normalize(await self._bot.api.call_action("get_version_info"))
+                self._app_name = info.get("app_name", "") if isinstance(info, dict) else ""
+                self._is_llbot = self._app_name in ("LLOneBot", "SnowLuma")
+            except Exception:
+                self._is_llbot = False
+                self._app_name = ""
+            self._detected = True
+        return True
+
+    def is_ready(self) -> bool:
+        return self._valid(self._bot)
 
     def diagnose(self) -> dict:
-        """侦察：列出实际可用的平台名，以及每个适配器暴露的 action 方法。"""
-        found = self._discover_all()
-        details = {}
-        for plat, adapter in found.items():
-            methods = [m for m in self.ACTION_METHODS if callable(getattr(adapter, m, None))]
-            sub_methods: dict = {}
-            for attr in self.WRAPPER_ATTRS:
-                sub = getattr(adapter, attr, None)
-                if sub is not None:
-                    sm = [m for m in self.ACTION_METHODS if callable(getattr(sub, m, None))]
-                    if sm:
-                        sub_methods[attr] = sm
-            details[str(plat)] = {
-                "type": type(adapter).__name__,
-                "methods": methods,
-                "wrapper_methods": sub_methods,
-                "usable": bool(methods or sub_methods),
-            }
-        return {"platforms": list(found.keys()), "details": details}
+        """诊断：输出真实绑定状态与可用接口，便于定位。"""
+        return {
+            "bound": self._valid(self._bot),
+            "source": self._bound_from or "(未绑定)",
+            "app_name": self._app_name,
+            "is_llbot": self._is_llbot,
+            "platform": self.platform,
+            "last_error": self._last_error,
+            "has_get_platform": callable(getattr(self.context, "get_platform", None)),
+            "has_get_platform_adapter": callable(
+                getattr(self.context, "get_platform_adapter", None)
+            ),
+        }
 
-    async def _get_adapter(self):
-        if self._adapter is not None:
-            return self._adapter
-        found = self._discover_all()
-        for plat, adapter in found.items():
-            if self._has_action(adapter):
-                self._adapter = adapter
-                self._resolved_platform = plat
-                return self._adapter
-        return None
+    async def probe(self, group_id: str) -> dict:
+        """真实探测：拿版本信息 + 尝试列一次根目录文件。"""
+        out = dict(self.diagnose())
+        out["probe"] = {}
+        if not self._valid(self._bot):
+            out["probe"]["error"] = "尚未绑定 bot，请在群内触发一次指令"
+            return out
+        try:
+            ver = _normalize(await self._bot.api.call_action("get_version_info"))
+            out["probe"]["version"] = ver
+        except Exception as e:
+            out["probe"]["version_error"] = str(e)
+        try:
+            data = await self._list_dir(str(group_id), "")
+            out["probe"]["root_files"] = len(data.get("files", []))
+            out["probe"]["root_folders"] = len(data.get("folders", []))
+            out["probe"]["sample"] = [
+                f.get("file_name") for f in data.get("files", [])[:3] if isinstance(f, dict)
+            ]
+        except Exception as e:
+            out["probe"]["list_error"] = str(e)
+        return out
 
-    async def _call(self, action: str, **params):
-        import inspect
-
-        found = self._discover_all()
-        for plat, adapter in found.items():
-            try:
-                result = self._invoke(adapter, action, **params)
-                if inspect.isawaitable(result):
-                    result = await result
-                return result
-            except Exception:  # 该适配器调不动，换下一个
-                continue
-        # 仍失败：给出诊断信息，便于定位
-        diag = self.diagnose()
-        plat_line = ", ".join(diag["platforms"] or ["(无)"])
-        raise RuntimeError(
-            "无法获取/调用 QQ 群文件适配器。已注册平台：" + plat_line +
-            "。请确认：1) 已接入支持群文件系统的 QQ 适配器（gocqhttp / Lagrange 等）且在线；"
-            "2) 若仅离线测试，可在插件配置中将 BACKEND 设为 local；"
-            "3) 若平台名特殊，可在配置 ONEBOT_PLATFORM 中指定。（细节：" + str(diag["details"]) + "）"
-        )
+    # ---------- 原始 action 调用 ----------
+    async def _call(self, action: str, **params) -> dict:
+        self.bind_from_context()
+        if not self._valid(self._bot):
+            raise RuntimeError(
+                "尚未绑定 OneBot 客户端（event.bot / context.get_platform）。"
+                "请在群聊中触发一次指令，或确认已接入 aiocqhttp 适配器且在线。"
+            )
+        try:
+            result = await self._bot.api.call_action(action, **params)
+        except Exception as e:
+            raise RuntimeError(action + " 调用失败: " + str(e))
+        return _normalize(result)
 
     # ---------- 读取 ----------
+    async def _list_dir(self, group_id: str, folder_id: str) -> dict:
+        """根目录用 get_group_root_files，子目录用 get_group_files_by_folder。"""
+        gid = int(group_id)
+        if not folder_id or folder_id == "/":
+            args = {"group_id": gid}
+            if not self._is_llbot:
+                args["file_count"] = 2000
+            return await self._call("get_group_root_files", **args)
+        args = {"group_id": gid, "folder_id": folder_id}
+        if not self._is_llbot:
+            args["file_count"] = 2000
+        return await self._call("get_group_files_by_folder", **args)
+
     async def list_files(self, group_id: str, folder_id: str = "") -> List[FileNode]:
-        data = await self._call(
-            "get_group_files_by_folder", group_id=int(group_id), folder_id=folder_id
-        )
-        files = (data or {}).get("files", [])
-        return [self._to_node(f, folder_id) for f in files if isinstance(f, dict)]
+        data = await self._list_dir(group_id, folder_id)
+        return [
+            self._to_node(f, folder_id)
+            for f in (data.get("files", []) or [])
+            if isinstance(f, dict)
+        ]
 
     async def list_folders(self, group_id: str, folder_id: str = "") -> List[FileNode]:
-        data = await self._call(
-            "get_group_files_by_folder", group_id=int(group_id), folder_id=folder_id
-        )
-        folders = (data or {}).get("folders", [])
-        return [self._to_folder(f) for f in folders if isinstance(f, dict)]
+        data = await self._list_dir(group_id, folder_id)
+        return [
+            self._to_folder(f)
+            for f in (data.get("folders", []) or [])
+            if isinstance(f, dict)
+        ]
 
     @staticmethod
     def _to_node(f: dict, parent_id: str) -> FileNode:
-        # 失效判定：dead_time 存在且早于当前时间（且不为 0 表示永久）
         dead_time = f.get("dead_time", 0) or 0
         dead = bool(dead_time) and dead_time < int(time.time())
         return FileNode(
@@ -217,59 +204,82 @@ class OneBotFileBackend(FileBackend):
         )
 
     async def get_file_url(self, group_id: str, file_id: str) -> Optional[str]:
-        # 需要先拿到 busid：尝试从文件信息补充；OneBot 的 get_group_file_url 需要 busid
-        info = await self.get_file_info(group_id, file_id)
-        if info is None:
-            return None
-        if info.dead:
-            return None
+        # 参考实现：get_group_file_url 只需 group_id + file_id，无需 busid
         try:
             data = await self._call(
-                "get_group_file_url",
-                group_id=int(group_id),
-                file_id=file_id,
-                busid=info.busid,
+                "get_group_file_url", group_id=int(group_id), file_id=file_id
             )
         except RuntimeError:
             return None
-        url = (data or {}).get("url", "")
-        return url or None
+        return (data or {}).get("url") or None
 
     async def get_file_info(self, group_id: str, file_id: str) -> Optional[FileNode]:
-        # OneBot 没有单文件查询，需遍历根 + 已知文件夹。这里采用轻量策略：
-        # 仅从根目录列表里找；深层文件交给 manager 的递归扫描补齐。
-        try:
-            data = await self._call(
-                "get_group_root_files", group_id=int(group_id)
-            )
-        except RuntimeError:
+        """递归查找单个文件节点（OneBot 无单文件查询接口）。"""
+        visited = set()
+
+        async def walk(fid: str, depth: int = 0):
+            if depth > 8 or fid in visited:
+                return None
+            visited.add(fid)
+            try:
+                data = await self._list_dir(group_id, fid)
+            except RuntimeError:
+                return None
+            for f in data.get("files", []) or []:
+                if isinstance(f, dict) and f.get("file_id") == file_id:
+                    return self._to_node(f, fid)
+            for fo in data.get("folders", []) or []:
+                if isinstance(fo, dict) and fo.get("folder_id"):
+                    hit = await walk(fo["folder_id"], depth + 1)
+                    if hit:
+                        return hit
             return None
-        for f in (data or {}).get("files", []):
-            if f.get("file_id") == file_id:
-                return self._to_node(f, "")
-        return None
+
+        return await walk("")
 
     # ---------- 写入 ----------
     async def create_folder(self, group_id: str, parent_id: str, name: str) -> Optional[str]:
-        data = await self._call(
-            "create_group_file_folder",
-            group_id=int(group_id),
-            folder_id=parent_id,
-            folder_name=name,
-        )
-        return (data or {}).get("folder_id") or None
+        # NapCat/OB11 用 folder_name；LLOneBot 用 name
+        key = "name" if self._is_llbot else "folder_name"
+        try:
+            data = await self._call(
+                "create_group_file_folder", group_id=int(group_id), **{key: name}
+            )
+        except RuntimeError:
+            return None
+        fid = (data or {}).get("folder_id")
+        if fid:
+            return fid
+        # 部分协议端不返回 folder_id，回查目录
+        try:
+            folders = await self.list_folders(group_id, "")
+            for fo in folders:
+                if fo.name == name:
+                    return fo.id
+        except RuntimeError:
+            pass
+        return None
 
     async def move_file(self, group_id: str, file_id: str, new_folder_id: str) -> bool:
-        # 需要先知道文件当前所在 folder_id；这里接受调用方传入时通过 file 的 parent 处理。
-        # OneBot move 需要 folder_id（源）与 target_folder_id。为简化，尝试用 "" 根作为源。
+        # NapCat: current_parent_directory / target_parent_directory
+        # LLOneBot: parent_directory / target_directory
         try:
-            await self._call(
-                "move_group_file",
-                group_id=int(group_id),
-                folder_id="",
-                file_id=file_id,
-                target_folder_id=new_folder_id,
-            )
+            if self._is_llbot:
+                await self._call(
+                    "move_group_file",
+                    group_id=int(group_id),
+                    file_id=file_id,
+                    parent_directory="/",
+                    target_directory=new_folder_id or "/",
+                )
+            else:
+                await self._call(
+                    "move_group_file",
+                    group_id=int(group_id),
+                    file_id=file_id,
+                    current_parent_directory="/",
+                    target_parent_directory=new_folder_id or "/",
+                )
             return True
         except RuntimeError:
             return False
@@ -277,18 +287,13 @@ class OneBotFileBackend(FileBackend):
     async def delete_file(self, group_id: str, file_id: str) -> bool:
         try:
             await self._call(
-                "delete_group_file",
-                group_id=int(group_id),
-                folder_id="",
-                file_id=file_id,
+                "delete_group_file", group_id=int(group_id), file_id=file_id
             )
             return True
         except RuntimeError:
             return False
 
     async def download_file(self, group_id: str, file_id: str, dest_path: str) -> bool:
-        import os
-
         url = await self.get_file_url(group_id, file_id)
         if not url:
             return False
@@ -297,7 +302,7 @@ class OneBotFileBackend(FileBackend):
 
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
+                async with session.get(url, timeout=60) as resp:
                     if resp.status != 200:
                         return False
                     with open(dest_path, "wb") as fp:
@@ -307,18 +312,16 @@ class OneBotFileBackend(FileBackend):
             return False
 
     async def upload_file(self, group_id: str, folder_id: str, local_path: str) -> Optional[str]:
-        import os
-
         if not os.path.isfile(local_path):
             return None
         try:
             data = await self._call(
                 "upload_group_file",
                 group_id=int(group_id),
-                file=os.path.abspath(local_path),
+                file=f"file://{os.path.abspath(local_path)}",
                 name=os.path.basename(local_path),
-                folder=folder_id,
+                folder_id=folder_id or "/",
             )
-            return (data or {}).get("file_id") or None
+            return (data or {}).get("file_id") or "uploaded"
         except RuntimeError:
             return None

@@ -54,7 +54,7 @@ class FileHandlers:
     # ---------- 帮助 ----------
     async def handle_help(self, event: AstrMessageEvent):
         text = (
-            "📂 QQ群聊文件管理 v1.0.2 指令\n"
+            "📂 QQ群聊文件管理 v1.0.3 指令\n"
             "━━━━━━━━━━━━━━━━\n"
             "  群文件列表 [文件夹]\n"
             "    └─ 查看群文件系统的文件/文件夹\n"
@@ -73,9 +73,10 @@ class FileHandlers:
             "  文件管理配置\n"
             "    └─ 查看当前插件配置\n"
             "  群文件诊断\n"
-            "    └─ 侦察当前已注册的 QQ 适配器平台名与方法（排查后端连接问题）\n"
+            "    └─ 检查 bot 绑定、协议端类型、能否读取真实群文件\n"
             "━━━━━━━━━━━━━━━━\n"
-            "安全提示：归类/清理默认试运行，确认无误后加 --force 执行。"
+            "安全提示：归类/清理默认试运行，确认无误后加 --force 执行。\n"
+            "后端：auto 优先用 event.bot 操作真实群文件；未接适配器时自动降级本地镜像。"
         )
         yield event.plain_result(text)
 
@@ -223,6 +224,7 @@ class FileHandlers:
         lines = ["⚙️ 文件管理当前配置："]
         for k in (
             "BACKEND",
+            "ONEBOT_PLATFORM",
             "ENABLE_AUTO_CLASSIFY",
             "ENABLE_AUTO_CLEAN",
             "AUTO_MAINTENANCE_INTERVAL",

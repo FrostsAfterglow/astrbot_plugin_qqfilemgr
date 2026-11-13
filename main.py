@@ -39,7 +39,7 @@ CMD_DIAG = "群文件诊断"
     "astrbot_plugin_qqfilemgr",
     "FrostsAfterglow",
     "QQ群聊文件管理：自动归类 / 失效清理 / 永久保存",
-    "1.0.2",
+    "1.0.3",
     "https://github.com/FrostsAfterglow/astrbot_plugin_qqfilemgr",
 )
 class QQFileManagerPlugin(Star):
@@ -61,7 +61,8 @@ class QQFileManagerPlugin(Star):
         # 数据库
         self.db = FileDB(os.path.join(self.data_dir, "filemgr.db"))
 
-        # 后端
+        # 后端（auto 模式保存 OneBot 实例，便于绑定恢复时可逆切换）
+        self._onebot: OneBotFileBackend | None = None
         self.backend: FileBackend = self._build_backend()
 
         # 管理器
@@ -84,6 +85,7 @@ class QQFileManagerPlugin(Star):
         # 已见过的群（供自动维护使用）
         self._seen_groups = set()
         self._bg_task = None
+        self._degraded = False
         self._start_auto_maintenance()
 
         self.logger.info("QQ群聊文件管理插件已加载（后端：%s）", self.config.get("BACKEND", "auto"))
@@ -94,30 +96,54 @@ class QQFileManagerPlugin(Star):
         ob_platform = str(self.config.get("ONEBOT_PLATFORM", "aiocqhttp") or "aiocqhttp")
         if mode == "local":
             return LocalBackend(self.local_base)
-        if mode == "onebot":
-            return OneBotFileBackend(self.context, platform=ob_platform)
-        # auto：优先 OneBot；若需离线测试可改为 local
-        return OneBotFileBackend(self.context, platform=ob_platform)
+        ob = OneBotFileBackend(self.context, platform=ob_platform)
+        self._onebot = ob
+        return ob
+
+    # ---------- 指令前准备：绑定 event.bot（可逆） ----------
+    async def _prepare_backend(self, event):
+        """每次指令前尝试绑定当前消息的 event.bot 到 OneBot 后端。
+
+        - onebot 模式：绑定失败则保留错误，由容错包装提示。
+        - auto 模式：绑定成功切回真实群文件；绑定失败降级到 local 本地镜像。
+        返回：是否「本次刚发生降级」（用于只提示一次）。
+        """
+        mode = str(self.config.get("BACKEND", "auto") or "auto").lower()
+        if mode == "local" or self._onebot is None:
+            return False
+
+        ok = await self._onebot.ensure_ready(event)
+        just_degraded = False
+        if ok:
+            if self._degraded or not isinstance(self.backend, OneBotFileBackend):
+                self.backend = self._onebot
+                self.manager.backend = self._onebot
+            self._degraded = False
+        elif mode == "auto":
+            if not self._degraded:
+                just_degraded = True
+            self.backend = LocalBackend(self.local_base)
+            self.manager.backend = self.backend
+            self._degraded = True
+        # onebot 强制模式：ok=False 时保持 OneBot，让 RuntimeError 正常抛出
+        return just_degraded
 
     # ---------- 指令容错包装 ----------
     async def _safe_yield(self, event, gen):
-        """包装 handler 生成器：捕获后端 RuntimeError，转为友好提示而非崩溃。"""
+        """包装 handler 生成器：绑定 event.bot + 捕获后端错误，转为友好提示而非崩溃。"""
         try:
+            degraded = await self._prepare_backend(event)
+            if degraded:
+                yield event.plain_result(
+                    "ℹ️ 未检测到在线的 QQ 适配器，已自动切换为【本地镜像模式】。\n"
+                    "当前指令在本地演示目录上执行；接入 aiocqhttp/NapCat 后会自动切回真实群文件。\n"
+                    "（如需强制走真实群文件，把 BACKEND 设为 onebot；发『群文件诊断』查看详情）"
+                )
             async for r in gen:
                 yield r
         except RuntimeError as e:
             msg = str(e)
-            if "适配器" in msg or "BACKEND" in msg or "local" in msg:
-                yield event.plain_result(
-                    "⚠️ 无法连接 QQ 群文件后端。\n"
-                    "若你尚未接入支持群文件系统的 QQ 适配器（gocqhttp / Lagrange），\n"
-                    "请在插件配置中将 BACKEND 设为 local 进行离线测试；\n"
-                    "若已接入，请确认适配器在线（默认尝试 aiocqhttp / onebot / qq 等平台名），\n"
-                    "或在配置 ONEBOT_PLATFORM 中指定你的平台名。\n"
-                    "（后端详情：" + msg + "）"
-                )
-            else:
-                yield event.plain_result("❌ 操作失败：" + msg)
+            yield event.plain_result("❌ 群文件操作失败：" + msg)
 
     # ---------- 后台定时维护 ----------
     def _start_auto_maintenance(self):
@@ -196,27 +222,52 @@ class QQFileManagerPlugin(Star):
     # ---------- 指令：诊断 ----------
     @filter.command(CMD_DIAG, "诊断 QQ 群文件后端")
     async def cmd_diag(self, event: AstrMessageEvent):
+        try:
+            await self._prepare_backend(event)
+        except Exception:
+            pass
         backend_mode = str(self.config.get("BACKEND", "auto") or "auto")
+        degraded = getattr(self, "_degraded", False)
         lines = [f"🔧 群文件后端诊断（BACKEND={backend_mode}）"]
-        diag = getattr(self.backend, "diagnose", None)
-        if callable(diag):
+        lines.append("当前模式: " + ("本地镜像(降级)" if degraded else
+                                    ("本地镜像" if isinstance(self.backend, LocalBackend) else "OneBot")))
+        if self._onebot is not None:
+            # 诊断始终基于 OneBot 实例探测（即使当前处于降级/本地模式）
             try:
-                info = diag()
+                await self._onebot.ensure_ready(event)
+                info = await self._onebot.probe(self._group_id_of(event))
             except Exception as e:  # noqa
                 info = {"error": str(e)}
-            plats = info.get("platforms", [])
-            lines.append(f"已注册平台({len(plats)}): {', '.join(plats) or '(无)'}")
-            for plat, d in (info.get("details", {}) or {}).items():
-                lines.append(
-                    f"  · {plat}: type={d.get('type')} 可用={d.get('usable')} "
-                    f"方法={d.get('methods')} 包装={d.get('wrapper_methods')}"
-                )
-            if not plats:
-                lines.append("未枚举到任何平台适配器。可能原因：")
-                lines.append("  1) 当前 AstrBot 版本取适配器的接口不同；")
-                lines.append("  2) 尚未接入 QQ 适配器（gocqhttp/Lagrange）；")
-                lines.append("  3) 适配器未在线。")
-                lines.append("若仅想试用功能，请把 BACKEND 设为 local。")
+            lines.append(f"bot 已绑定: {info.get('bound')}  来源: {info.get('source')}")
+            lines.append(f"协议端: {info.get('app_name') or '(未探测)'}"
+                         + ("（LLOneBot 参数）" if info.get("is_llbot") else ""))
+            lines.append(f"context 接口: get_platform={info.get('has_get_platform')} "
+                         f"get_platform_adapter={info.get('has_get_platform_adapter')}")
+            probe = info.get("probe", {}) or {}
+            if "version" in probe:
+                v = probe["version"]
+                lines.append("get_version_info: " + str(v)[:120])
+            if "version_error" in probe:
+                lines.append("版本探测失败: " + str(probe["version_error"])[:100])
+            if "root_files" in probe:
+                lines.append(f"根目录: {probe['root_files']} 个文件 / "
+                             f"{probe.get('root_folders', 0)} 个文件夹")
+                if probe.get("sample"):
+                    lines.append("示例: " + ", ".join(str(x) for x in probe["sample"]))
+            if "list_error" in probe:
+                lines.append("列目录失败: " + str(probe["list_error"])[:100])
+            if "error" in probe:
+                lines.append("探测: " + str(probe["error"]))
+            if info.get("bound") and "root_files" in probe:
+                lines.append("✅ 后端可用，归类/清理/永久保存可直接操作真实群文件。")
+            else:
+                lines.append("如未绑定：请确认已接入 aiocqhttp 适配器并在线；")
+                lines.append("或把 BACKEND 设为 local 使用离线镜像。")
         else:
-            lines.append("当前后端为本地镜像（local），不涉及 QQ 适配器。")
+            lines.append("当前为本地镜像后端，所有指令在本地演示目录运行。")
         yield event.plain_result("\n".join(lines))
+
+    @staticmethod
+    def _group_id_of(event) -> str:
+        gid = event.get_group_id()
+        return str(gid) if gid else "0"

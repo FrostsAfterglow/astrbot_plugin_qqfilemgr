@@ -189,102 +189,183 @@ class TestHelpers(unittest.TestCase):
         os.remove(p)
 
 
-class _FakeAdapter:
-    """同步版 call_action。"""
+class _FakeAPI:
+    """模拟 aiocqhttp 的 bot.api，提供 async call_action。"""
 
-    def call_action(self, action, **kw):
-        return {"ok": True, "echo": action}
+    def __init__(self, app_name="NapCat", wrap=False, url="http://dl/file"):
+        self.app_name = app_name
+        self.wrap = wrap                 # 是否用 {"data": {...}} 包裹返回值
+        self.url = url
+        self.calls = []                  # 记录 (action, params)，供断言
 
-
-class _AsyncAdapter:
-    """异步版 call_action（真实 AstrBot 适配器多为 async）。"""
+    def _pack(self, payload):
+        return {"status": "ok", "retcode": 0, "data": payload} if self.wrap else payload
 
     async def call_action(self, action, **kw):
-        return {"ok": True, "echo": action}
+        self.calls.append((action, kw))
+        if action == "get_version_info":
+            return self._pack({"app_name": self.app_name})
+        if action in ("get_group_root_files", "get_group_files_by_folder"):
+            return self._pack({
+                "files": [
+                    {"file_id": "F1", "file_name": "a.jpg", "file_size": 100, "busid": 7},
+                    {"file_id": "F2", "file_name": "b.pdf", "file_size": 200, "busid": 8},
+                ],
+                "folders": [
+                    {"folder_id": "D1", "folder_name": "图片", "parent_folder_id": "/"},
+                ],
+            })
+        if action == "get_group_file_url":
+            return self._pack({"url": self.url} if self.url else {})
+        if action == "create_group_file_folder":
+            return self._pack({"folder_id": "D9"})
+        if action in ("move_group_file", "delete_group_file"):
+            return self._pack({"status": "ok", "retcode": 0})
+        if action == "upload_group_file":
+            return self._pack({"file_id": "FU"})
+        return self._pack({})
 
 
-class _WrappedAdapter:
-    """action 方法挂在 bot 子对象上。"""
-
-    def __init__(self):
-        self.bot = _FakeAdapter()
+class _FakeBot:
+    def __init__(self, **kw):
+        self.api = _FakeAPI(**kw)
 
 
-class _FakeContext:
-    def __init__(self, adapters: dict):
-        self._adapters = adapters
+class _FakeEvent:
+    def __init__(self, bot):
+        self.bot = bot
+
+
+class _Ctx:
+    """离线 context：没有 get_platform（模拟 AstrBot 未即时暴露平台管理器）。"""
 
     def get_platform_adapter(self, plat):
-        return self._adapters.get(plat)
+        return None
 
 
-class TestOneBotDiscovery(unittest.TestCase):
-    def test_finds_adapter_on_named_platform(self):
-        ctx = _FakeContext({"aiocqhttp": _FakeAdapter()})
+class TestOneBotBackend(unittest.TestCase):
+    def _bound(self, **kw):
+        ctx = _Ctx()
         be = OneBotFileBackend(ctx, platform="aiocqhttp")
-        ad = run(be._get_adapter())
-        self.assertIsNotNone(ad)
-        self.assertEqual(be._resolved_platform, "aiocqhttp")
+        bot = _FakeBot(**kw)
+        be.bind_event(_FakeEvent(bot))
+        return be, bot
 
-    def test_falls_back_to_other_platform_name(self):
-        # 用户平台名是 qq 而非默认 aiocqhttp，应能自动发现
-        ctx = _FakeContext({"qq": _FakeAdapter()})
+    def test_bind_from_event_bot(self):
+        be, _ = self._bound()
+        self.assertTrue(be.is_ready())
+        self.assertEqual(be._bound_from, "event.bot")
+
+    def test_ensure_ready_detects_napcat(self):
+        be, _ = self._bound(app_name="NapCat")
+        self.assertTrue(run(be.ensure_ready()))
+        self.assertFalse(be._is_llbot)
+        self.assertEqual(be._app_name, "NapCat")
+
+    def test_ensure_ready_detects_llonebot(self):
+        be, _ = self._bound(app_name="LLOneBot")
+        run(be.ensure_ready())
+        self.assertTrue(be._is_llbot)
+
+    def test_root_uses_get_group_root_files(self):
+        be, bot = self._bound()
+        run(be.ensure_ready())
+        files = run(be.list_files("100", ""))
+        self.assertEqual(len(files), 2)
+        self.assertEqual(files[0].name, "a.jpg")
+        self.assertTrue(any(a == "get_group_root_files" for a, _ in bot.api.calls))
+
+    def test_subfolder_uses_by_folder(self):
+        be, bot = self._bound()
+        run(be.ensure_ready())
+        run(be.list_files("100", "D1"))
+        self.assertTrue(any(a == "get_group_files_by_folder" for a, _ in bot.api.calls))
+
+    def test_data_wrapped_payload(self):
+        be, _ = self._bound(wrap=True)
+        run(be.ensure_ready())
+        files = run(be.list_files("100", ""))
+        self.assertEqual(len(files), 2)  # 应正确解开 data 包裹
+
+    def test_list_folders(self):
+        be, _ = self._bound()
+        run(be.ensure_ready())
+        folders = run(be.list_folders("100", ""))
+        self.assertEqual(len(folders), 1)
+        self.assertEqual(folders[0].name, "图片")
+
+    def test_get_file_url_no_busid(self):
+        be, bot = self._bound()
+        run(be.ensure_ready())
+        url = run(be.get_file_url("100", "F1"))
+        self.assertEqual(url, "http://dl/file")
+        # 参数里不应需要 busid
+        p = [kw for a, kw in bot.api.calls if a == "get_group_file_url"][0]
+        self.assertNotIn("busid", p)
+
+    def test_get_file_info_recursive(self):
+        be, _ = self._bound()
+        run(be.ensure_ready())
+        node = run(be.get_file_info("100", "F2"))
+        self.assertIsNotNone(node)
+        self.assertEqual(node.name, "b.pdf")
+
+    def test_create_folder_napcat_param(self):
+        be, bot = self._bound(app_name="NapCat")
+        run(be.ensure_ready())
+        fid = run(be.create_folder("100", "", "文档"))
+        self.assertEqual(fid, "D9")
+        p = [kw for a, kw in bot.api.calls if a == "create_group_file_folder"][0]
+        self.assertIn("folder_name", p)
+
+    def test_create_folder_llonebot_param(self):
+        be, bot = self._bound(app_name="LLOneBot")
+        run(be.ensure_ready())
+        run(be.create_folder("100", "", "文档"))
+        p = [kw for a, kw in bot.api.calls if a == "create_group_file_folder"][0]
+        self.assertIn("name", p)
+
+    def test_move_file_params(self):
+        be, bot = self._bound()
+        run(be.ensure_ready())
+        ok = run(be.move_file("100", "F1", "D1"))
+        self.assertTrue(ok)
+        p = [kw for a, kw in bot.api.calls if a == "move_group_file"][0]
+        self.assertIn("current_parent_directory", p)
+        self.assertEqual(p["target_parent_directory"], "D1")
+
+    def test_delete_file(self):
+        be, bot = self._bound()
+        run(be.ensure_ready())
+        ok = run(be.delete_file("100", "F1"))
+        self.assertTrue(ok)
+        p = [kw for a, kw in bot.api.calls if a == "delete_group_file"][0]
+        self.assertEqual(p["file_id"], "F1")
+
+    def test_dead_file_no_url(self):
+        be, _ = self._bound(url="")
+        run(be.ensure_ready())
+        self.assertIsNone(run(be.get_file_url("100", "F1")))
+
+    def test_not_bound_raises(self):
+        ctx = _Ctx()
         be = OneBotFileBackend(ctx, platform="aiocqhttp")
-        ad = run(be._get_adapter())
-        self.assertIsNotNone(ad)
-        self.assertEqual(be._resolved_platform, "qq")
-
-    def test_enumerate_when_only_internal_dict(self):
-        ctx = _FakeContext({})
-        ctx._platform_adapters = {"whatever": _FakeAdapter()}
-        be = OneBotFileBackend(ctx, platform="aiocqhttp")
-        ad = run(be._get_adapter())
-        self.assertIsNotNone(ad)
-
-    def test_get_platform_adapters_dict(self):
-        # 通过 get_platform_adapters() 返回 dict 的场景
-        class Ctx(_FakeContext):
-            def get_platform_adapters(self):
-                return {"onebot": _AsyncAdapter()}
-
-        be = OneBotFileBackend(Ctx({}), platform="aiocqhttp")
-        info = be.diagnose()
-        self.assertIn("onebot", info["platforms"])
-        self.assertTrue(info["details"]["onebot"]["usable"])
-
-    def test_no_adapter_returns_none(self):
-        ctx = _FakeContext({})
-        be = OneBotFileBackend(ctx, platform="aiocqhttp")
-        ad = run(be._get_adapter())
-        self.assertIsNone(ad)
+        self.assertFalse(be.is_ready())
         with self.assertRaises(RuntimeError):
             run(be._call("get_group_root_files", group_id=100))
 
-    def test_call_sync_action(self):
-        ctx = _FakeContext({"aiocqhttp": _FakeAdapter()})
-        be = OneBotFileBackend(ctx, platform="aiocqhttp")
-        r = run(be._call("get_group_root_files", group_id=100))
-        self.assertTrue(r["ok"])
-        self.assertEqual(r["echo"], "get_group_root_files")
-
-    def test_call_async_action(self):
-        ctx = _FakeContext({"onebot": _AsyncAdapter()})
-        be = OneBotFileBackend(ctx, platform="aiocqhttp")
-        r = run(be._call("get_group_root_files", group_id=100))
-        self.assertTrue(r["ok"])
-
-    def test_call_via_bot_wrapper(self):
-        ctx = _FakeContext({"qq": _WrappedAdapter()})
-        be = OneBotFileBackend(ctx, platform="aiocqhttp")
-        r = run(be._call("get_group_root_files", group_id=100))
-        self.assertTrue(r["ok"])
-
-    def test_diagnose_empty(self):
-        ctx = _FakeContext({})
-        be = OneBotFileBackend(ctx, platform="aiocqhttp")
+    def test_diagnose_fields(self):
+        be, _ = self._bound()
         info = be.diagnose()
-        self.assertEqual(info["platforms"], [])
-        self.assertEqual(info["details"], {})
+        self.assertTrue(info["bound"])
+        self.assertEqual(info["source"], "event.bot")
+
+    def test_probe_reports_root(self):
+        be, _ = self._bound()
+        run(be.ensure_ready())
+        info = run(be.probe("100"))
+        self.assertEqual(info["probe"]["root_files"], 2)
+        self.assertIn("a.jpg", info["probe"]["sample"])
 
 
 if __name__ == "__main__":
