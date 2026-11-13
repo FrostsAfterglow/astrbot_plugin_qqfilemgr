@@ -39,32 +39,46 @@ class FileHandlers:
     @staticmethod
     def _rest_text(event: AstrMessageEvent, cmd: str) -> str:
         """取指令关键字之后的全部文本（filter.command 普通参数只收首词）。"""
-        raw = event.get_message_str()
-        m = re.search(re.escape(cmd) + r"\s*(.*)", raw)
+        try:
+            raw = event.get_message_str() or ""
+        except Exception:
+            raw = ""
+        m = re.search(re.escape(cmd) + r"\s*(.*)", raw, flags=re.S)
         return m.group(1).strip() if m else ""
+
+    @classmethod
+    def _arg_text(cls, event: AstrMessageEvent, cmd: str, fallback: str = "") -> str:
+        """优先用原始消息里指令后的完整文本，避免被框架截断成首词。
+
+        ``filter.command`` 的 str 参数只接收第一个词，含空格的文件名或
+        「文件归类 图片 --force」这类多词参数都会丢失，因此这里以原始消息为准。
+        """
+        raw = cls._rest_text(event, cmd)
+        return raw if raw else (fallback or "")
 
     @staticmethod
     def _has_force(text: str) -> bool:
-        return bool(re.search(r"(--force|-f|强制)", text))
+        return bool(re.search(r"(--force|-f|强制)", text or ""))
 
     @staticmethod
     def _strip_force(text: str) -> str:
-        return re.sub(r"(--force|-f|强制)", "", text).strip()
+        return re.sub(r"(--force|-f|强制)", "", text or "").strip()
 
     # ---------- 帮助 ----------
     async def handle_help(self, event: AstrMessageEvent):
         text = (
-            "📂 QQ群聊文件管理 v1.0.3 指令\n"
+            "📂 QQ群聊文件管理 v1.0.4 指令\n"
             "━━━━━━━━━━━━━━━━\n"
             "  群文件列表 [文件夹]\n"
             "    └─ 查看群文件系统的文件/文件夹\n"
-            "  文件归类 [类别] [--force]\n"
+            "  文件归类 [--force]\n"
             "    └─ 把根目录文件按类型移动到「图片/视频/音频/文档/压缩包/其他」目录\n"
-            "    └─ 默认试运行(只报告)；加 --force 才真正移动\n"
-            "    └─ 可选类别只处理该类别，如：文件归类 图片 --force\n"
+            "    └─ 默认试运行(只报告)；真正执行请发：文件归类 --force（或「文件归类 强制」）\n"
+            "    └─ 只处理某一类：文件归类 图片 --force\n"
+            "    └─ 未知扩展名统一归入「其他」，可在 config/categories.json 自定义\n"
             "  清理失效文件 [--force]\n"
             "    └─ 扫描并清理无法下载的失效文件（已永久保存的可安全删除）\n"
-            "    └─ 默认试运行；加 --force 才真正删除\n"
+            "    └─ 默认试运行；真正删除请发：清理失效文件 --force\n"
             "  永久保存 <文件名或ID>\n"
             "    └─ 把群文件下载到本地永久存档（即使群文件失效也不丢）\n"
             "    └─ 可配置回传到群「永久保存」目录做双保险\n"
@@ -82,6 +96,7 @@ class FileHandlers:
 
     # ---------- 列表 ----------
     async def handle_list(self, event: AstrMessageEvent, folder: str = ""):
+        folder = self._arg_text(event, "群文件列表", folder)
         gid = self._group_id(event)
         if not gid:
             yield event.plain_result("该指令仅在群聊中可用。")
@@ -115,6 +130,7 @@ class FileHandlers:
         if not self._group_allowed(event):
             yield event.plain_result("当前群不在管理白名单内。")
             return
+        args = self._arg_text(event, "文件归类", args)
         force = self._has_force(args)
         rest = self._strip_force(args)
         target_cat = rest if rest else None
@@ -149,6 +165,7 @@ class FileHandlers:
         if not self._group_allowed(event):
             yield event.plain_result("当前群不在管理白名单内。")
             return
+        args = self._arg_text(event, "清理失效文件", args)
         force = self._has_force(args)
         dry_run = bool(self.config.get("DRY_RUN_DEFAULT", True)) and not force
         r = await self.manager.clean_invalid(gid, dry_run=dry_run)
@@ -180,7 +197,7 @@ class FileHandlers:
         if not self._group_allowed(event):
             yield event.plain_result("当前群不在管理白名单内。")
             return
-        target = name or self._rest_text(event, "永久保存")
+        target = self._arg_text(event, "永久保存", name)
         if not target:
             yield event.plain_result("用法：永久保存 <文件名或文件ID>")
             return

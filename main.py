@@ -39,7 +39,7 @@ CMD_DIAG = "群文件诊断"
     "astrbot_plugin_qqfilemgr",
     "FrostsAfterglow",
     "QQ群聊文件管理：自动归类 / 失效清理 / 永久保存",
-    "1.0.3",
+    "1.0.4",
     "https://github.com/FrostsAfterglow/astrbot_plugin_qqfilemgr",
 )
 class QQFileManagerPlugin(Star):
@@ -191,20 +191,20 @@ class QQFileManagerPlugin(Star):
 
     # ---------- 指令：归类 ----------
     @filter.command(CMD_CLASSIFY, "自动位移文件归类")
-    async def cmd_classify(self, event: AstrMessageEvent):
-        async for r in self._safe_yield(event, self.file_handlers.handle_classify(event)):
+    async def cmd_classify(self, event: AstrMessageEvent, args: str = ""):
+        async for r in self._safe_yield(event, self.file_handlers.handle_classify(event, args)):
             yield r
 
     # ---------- 指令：清理失效文件 ----------
     @filter.command(CMD_CLEAN, "清理已失效文件")
-    async def cmd_clean(self, event: AstrMessageEvent):
-        async for r in self._safe_yield(event, self.file_handlers.handle_clean(event)):
+    async def cmd_clean(self, event: AstrMessageEvent, args: str = ""):
+        async for r in self._safe_yield(event, self.file_handlers.handle_clean(event, args)):
             yield r
 
     # ---------- 指令：永久保存 ----------
     @filter.command(CMD_PERM, "将群文件转为永久保存")
-    async def cmd_perm(self, event: AstrMessageEvent):
-        async for r in self._safe_yield(event, self.file_handlers.handle_perm(event)):
+    async def cmd_perm(self, event: AstrMessageEvent, name: str = ""):
+        async for r in self._safe_yield(event, self.file_handlers.handle_perm(event, name)):
             yield r
 
     # ---------- 指令：永久文件列表 ----------

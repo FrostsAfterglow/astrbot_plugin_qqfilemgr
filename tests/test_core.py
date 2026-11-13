@@ -18,11 +18,32 @@ PLUGIN_ROOT = os.path.dirname(HERE)
 if PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, PLUGIN_ROOT)
 
+# file_handlers 仅把 AstrMessageEvent 用作类型注解；离线测试注入最小桩即可
+try:
+    import astrbot  # noqa: F401
+except ImportError:
+    import types
+
+    _astrbot = types.ModuleType("astrbot")
+    _api = types.ModuleType("astrbot.api")
+    _event = types.ModuleType("astrbot.api.event")
+
+    class _AstrMessageEventStub:  # noqa: D401
+        """占位类型，仅满足类型注解。"""
+
+    _event.AstrMessageEvent = _AstrMessageEventStub
+    _astrbot.api = _api
+    _api.event = _event
+    sys.modules["astrbot"] = _astrbot
+    sys.modules["astrbot.api"] = _api
+    sys.modules["astrbot.api.event"] = _event
+
 from core.classifier import Classifier  # noqa: E402
 from core.local_backend import LocalBackend  # noqa: E402
 from core.file_manager import FileManager, human_size, sha256_of_file  # noqa: E402
-from core.onebot_backend import OneBotFileBackend  # noqa: E402
+from core.onebot_backend import OneBotFileBackend, _normalize  # noqa: E402
 from data.database import FileDB  # noqa: E402
+from handlers.file_handlers import FileHandlers  # noqa: E402
 
 
 def run(coro):
@@ -366,6 +387,147 @@ class TestOneBotBackend(unittest.TestCase):
         info = run(be.probe("100"))
         self.assertEqual(info["probe"]["root_files"], 2)
         self.assertIn("a.jpg", info["probe"]["sample"])
+
+
+class _HandlerEvent:
+    """模拟 AstrMessageEvent：原始消息全文 + 群号 + 回复收集。"""
+
+    def __init__(self, text, gid="1070840810", sender="12345"):
+        self._text = text
+        self._gid = gid
+        self._sender = sender
+        self.results = []
+
+    def get_message_str(self):
+        return self._text
+
+    def get_group_id(self):
+        return self._gid
+
+    def get_sender_id(self):
+        return self._sender
+
+    def plain_result(self, text):
+        return ("plain", text)
+
+
+class _RecordingManager:
+    def __init__(self):
+        self.classify_calls = []
+        self.clean_calls = []
+        self.perm_calls = []
+
+    async def classify(self, gid, dry_run=True, target_category=None):
+        self.classify_calls.append((gid, dry_run, target_category))
+        return {"created_folders": [], "moved": [], "skipped": [], "errors": []}
+
+    async def clean_invalid(self, gid, dry_run=True):
+        self.clean_calls.append((gid, dry_run))
+        return {"alive": 0, "dead": [], "deleted": [], "skipped_saved": [], "errors": []}
+
+    async def permanent_save(self, gid, target, enable_upload=False):
+        self.perm_calls.append((gid, target))
+        return {"ok": True, "name": target, "category": "其他", "size_human": "1 KB",
+                "sha256": "0" * 64, "stored_path": "/tmp/x", "source_dead": False}
+
+
+def _handler(mgr=None):
+    return FileHandlers(context=None, config={"DRY_RUN_DEFAULT": True},
+                         manager=mgr or _RecordingManager(), classifier=None)
+
+
+def _collect(gen):
+    async def _go():
+        return [r async for r in gen]
+
+    return run(_go())
+
+
+class TestCommandArgs(unittest.TestCase):
+    """回归：--force 必须能从原始消息生效（此前 main.py 未传参数，恒为试运行）。"""
+
+    def test_force_enables_real_classify(self):
+        mgr = _RecordingManager()
+        h = _handler(mgr)
+        ev = _HandlerEvent("文件归类 --force")
+        _collect(h.handle_classify(ev))  # 模拟 main.py 未传 args 的情况
+        self.assertEqual(len(mgr.classify_calls), 1)
+        self.assertFalse(mgr.classify_calls[0][1], "--force 应关闭试运行")
+
+    def test_without_force_stays_dry_run(self):
+        mgr = _RecordingManager()
+        h = _handler(mgr)
+        _collect(h.handle_classify(_HandlerEvent("文件归类")))
+        self.assertTrue(mgr.classify_calls[0][1])
+
+    def test_force_with_category_and_chinese_keyword(self):
+        mgr = _RecordingManager()
+        h = _handler(mgr)
+        _collect(h.handle_classify(_HandlerEvent("文件归类 其他 强制")))
+        _, dry, cat = mgr.classify_calls[0]
+        self.assertFalse(dry)
+        self.assertEqual(cat, "其他")
+
+    def test_multiword_force_not_truncated(self):
+        """模拟框架只把首词传进来：仍应以原始消息全文为准。"""
+        mgr = _RecordingManager()
+        h = _handler(mgr)
+        _collect(h.handle_classify(_HandlerEvent("文件归类 图片 --force"), "图片"))
+        _, dry, cat = mgr.classify_calls[0]
+        self.assertFalse(dry)
+        self.assertEqual(cat, "图片")
+
+    def test_clean_force(self):
+        mgr = _RecordingManager()
+        h = _handler(mgr)
+        _collect(h.handle_clean(_HandlerEvent("清理失效文件 --force")))
+        self.assertFalse(mgr.clean_calls[0][1])
+
+    def test_filename_with_spaces_kept_intact(self):
+        mgr = _RecordingManager()
+        h = _handler(mgr)
+        name = "Muv-Luv Tactics：战争合奏 V1.5.rwmod"
+        _collect(h.handle_perm(_HandlerEvent("永久保存 " + name), "Muv-Luv"))
+        self.assertEqual(mgr.perm_calls[0][1], name)
+
+    def test_list_folder_argument(self):
+        h = _handler()
+        self.assertEqual(FileHandlers._arg_text(_HandlerEvent("群文件列表 图片"), "群文件列表"), "图片")
+        self.assertEqual(FileHandlers._arg_text(_HandlerEvent("群文件列表"), "群文件列表", ""), "")
+
+
+class TestMoveResponseCheck(unittest.TestCase):
+    def test_failed_response_is_not_success(self):
+        self.assertFalse(OneBotFileBackend._action_ok({"status": "failed", "retcode": 1400}))
+        self.assertFalse(OneBotFileBackend._action_ok({"ok": False}))
+        self.assertFalse(OneBotFileBackend._action_ok({"retcode": 1200}))
+
+    def test_ok_response_is_success(self):
+        self.assertTrue(OneBotFileBackend._action_ok({"status": "ok", "retcode": 0}))
+        self.assertTrue(OneBotFileBackend._action_ok({}))
+        self.assertTrue(OneBotFileBackend._action_ok(None))
+
+    def test_failed_payload_not_swallowed_by_normalize(self):
+        r = _normalize({"status": "failed", "retcode": 1400, "data": {}})
+        self.assertEqual(r.get("status"), "failed")
+
+    def test_move_reports_failure(self):
+        class _FailAPI(_FakeAPI):
+            async def call_action(self, action, **kw):
+                self.calls.append((action, kw))
+                if action == "get_version_info":
+                    return {"app_name": "NapCat"}
+                if action == "move_group_file":
+                    return {"status": "failed", "retcode": 1400}
+                return {}
+
+        ctx = _Ctx()
+        be = OneBotFileBackend(ctx, platform="aiocqhttp")
+        bot = _FakeBot()
+        bot.api = _FailAPI()
+        be.bind_event(_FakeEvent(bot))
+        run(be.ensure_ready())
+        self.assertFalse(run(be.move_file("100", "F1", "D1")))
 
 
 if __name__ == "__main__":

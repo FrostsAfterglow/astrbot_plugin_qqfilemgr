@@ -17,10 +17,17 @@ from .file_backend import FileBackend, FileNode
 
 
 def _normalize(result) -> dict:
-    """兼容 OneBot 返回值被 {'data': {...}} 包裹的情况（部分协议端如此）。"""
-    if isinstance(result, dict) and isinstance(result.get("data"), dict):
+    """兼容 OneBot 返回值被 {'data': {...}} 包裹的情况（部分协议端如此）。
+
+    明确失败的响应（status=failed）保持原样，避免解包后丢失失败标志。
+    """
+    if not isinstance(result, dict):
+        return {}
+    if result.get("status") == "failed":
+        return result
+    if isinstance(result.get("data"), dict):
         return result.get("data", {})
-    return result if isinstance(result, dict) else {}
+    return result
 
 
 class OneBotFileBackend(FileBackend):
@@ -260,12 +267,24 @@ class OneBotFileBackend(FileBackend):
             pass
         return None
 
+    @staticmethod
+    def _action_ok(data) -> bool:
+        """判定 action 响应是否真成功，防止「协议端返回失败但没抛异常」被误判为成功。"""
+        if not isinstance(data, dict) or not data:
+            return True  # 部分协议端成功时无返回体
+        if data.get("status") == "failed" or data.get("ok") is False:
+            return False
+        rc = data.get("retcode")
+        if rc is not None and str(rc) not in ("0", ""):
+            return False
+        return True
+
     async def move_file(self, group_id: str, file_id: str, new_folder_id: str) -> bool:
         # NapCat: current_parent_directory / target_parent_directory
         # LLOneBot: parent_directory / target_directory
         try:
             if self._is_llbot:
-                await self._call(
+                data = await self._call(
                     "move_group_file",
                     group_id=int(group_id),
                     file_id=file_id,
@@ -273,23 +292,23 @@ class OneBotFileBackend(FileBackend):
                     target_directory=new_folder_id or "/",
                 )
             else:
-                await self._call(
+                data = await self._call(
                     "move_group_file",
                     group_id=int(group_id),
                     file_id=file_id,
                     current_parent_directory="/",
                     target_parent_directory=new_folder_id or "/",
                 )
-            return True
+            return self._action_ok(data)
         except RuntimeError:
             return False
 
     async def delete_file(self, group_id: str, file_id: str) -> bool:
         try:
-            await self._call(
+            data = await self._call(
                 "delete_group_file", group_id=int(group_id), file_id=file_id
             )
-            return True
+            return self._action_ok(data)
         except RuntimeError:
             return False
 
