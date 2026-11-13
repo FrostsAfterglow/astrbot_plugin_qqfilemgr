@@ -36,6 +36,12 @@
     "default": true,
     "hint": "为安全起见默认开启；指令加 --force 才会真正落盘改动。"
   },
+  "ENABLE_MOVE_FALLBACK": {
+    "type": "bool",
+    "description": "协议端不支持直接移动文件时，改用「下载→重新上传→删除原文件」完成归类",
+    "default": true,
+    "hint": "部分 OneBot 协议端没有 move_group_file 接口；开启后自动走参考插件验证过的重传兜底，仅上传成功才删除源文件。关闭则直接报失败。"
+  },
   "ENABLE_PERMANENT_UPLOAD": {
     "type": "bool",
     "description": "永久保存时是否同时回传到群文件系统的「永久保存」目录",

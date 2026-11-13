@@ -39,7 +39,7 @@ CMD_DIAG = "群文件诊断"
     "astrbot_plugin_qqfilemgr",
     "FrostsAfterglow",
     "QQ群聊文件管理：自动归类 / 失效清理 / 永久保存",
-    "1.0.4",
+    "1.0.5",
     "https://github.com/FrostsAfterglow/astrbot_plugin_qqfilemgr",
 )
 class QQFileManagerPlugin(Star):
@@ -241,6 +241,8 @@ class QQFileManagerPlugin(Star):
             lines.append(f"bot 已绑定: {info.get('bound')}  来源: {info.get('source')}")
             lines.append(f"协议端: {info.get('app_name') or '(未探测)'}"
                          + ("（LLOneBot 参数）" if info.get("is_llbot") else ""))
+            last_err = str(getattr(self._onebot, "last_move_error", "") or "")
+            lines.append("上次移动错误: " + (last_err[:220] or "(暂无记录)"))
             lines.append(f"context 接口: get_platform={info.get('has_get_platform')} "
                          f"get_platform_adapter={info.get('has_get_platform_adapter')}")
             probe = info.get("probe", {}) or {}

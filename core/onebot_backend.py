@@ -40,6 +40,7 @@ class OneBotFileBackend(FileBackend):
         self._is_llbot = False           # LLOneBot / SnowLuma 参数略有差异
         self._app_name = ""
         self._detected = False
+        self.last_move_error = ""        # 最近一次移动失败的真实原因，供回执/诊断
         self.bind_from_context()
 
     # ---------- 绑定 OneBot 客户端 ----------
@@ -280,28 +281,73 @@ class OneBotFileBackend(FileBackend):
         return True
 
     async def move_file(self, group_id: str, file_id: str, new_folder_id: str) -> bool:
-        # NapCat: current_parent_directory / target_parent_directory
-        # LLOneBot: parent_directory / target_directory
+        """优先用 move_group_file，依次尝试两类协议端的参数风格。
+
+        真实异常与失败响应写入 ``last_move_error``，不再静默吞掉，
+        便于回执与「群文件诊断」输出可定位的原因。
+        """
+        self.last_move_error = ""
+        napcat = {
+            "current_parent_directory": "/",
+            "target_parent_directory": new_folder_id or "/",
+        }
+        llonebot = {
+            "parent_directory": "/",
+            "target_directory": new_folder_id or "/",
+        }
+        variants = [llonebot, napcat] if self._is_llbot else [napcat, llonebot]
+        for extra in variants:
+            try:
+                data = await self._call(
+                    "move_group_file",
+                    group_id=int(group_id),
+                    file_id=file_id,
+                    **extra,
+                )
+            except RuntimeError as e:
+                self.last_move_error = str(e)
+                continue
+            if self._action_ok(data):
+                return True
+            self.last_move_error = "move_group_file 响应判定失败: " + str(data)[:200]
+        return False
+
+    async def relocate_by_reupload(
+        self, group_id: str, node: FileNode, target_folder_id: str
+    ) -> bool:
+        """协议端不支持移动时的兜底：下载 → 上传到目标目录 → 删除原文件。
+
+        参考 astrbot_plugin_GroupFS 的同步链路。只有上传确认成功后才删除
+        源文件，任何一步失败都保留原文件，避免数据丢失。
+        """
+        import shutil
+        import tempfile
+
+        tmpdir = tempfile.mkdtemp(prefix="qqfile_relocate_")
+        tmp = os.path.join(tmpdir, node.name or ("file_" + str(node.id)))
         try:
-            if self._is_llbot:
-                data = await self._call(
-                    "move_group_file",
-                    group_id=int(group_id),
-                    file_id=file_id,
-                    parent_directory="/",
-                    target_directory=new_folder_id or "/",
+            if not await self.download_file(group_id, node.id, tmp):
+                self.last_move_error = (
+                    "兜底失败：无法下载源文件（get_group_file_url 不可用或下载失败）；"
+                    "上次移动错误：" + (self.last_move_error or "无")
                 )
-            else:
-                data = await self._call(
-                    "move_group_file",
-                    group_id=int(group_id),
-                    file_id=file_id,
-                    current_parent_directory="/",
-                    target_parent_directory=new_folder_id or "/",
+                return False
+            if not await self.upload_file(group_id, target_folder_id, tmp):
+                self.last_move_error = (
+                    "兜底失败：上传到目标文件夹未成功，源文件已保留；"
+                    "上次移动错误：" + (self.last_move_error or "无")
                 )
-            return self._action_ok(data)
-        except RuntimeError:
-            return False
+                return False
+            if not await self.delete_file(group_id, node.id):
+                # 上传已成功，删除源失败只造成重复，不丢数据
+                self.last_move_error = (
+                    "兜底部分成功：已上传到目标文件夹，但删除原文件失败（可能出现重复文件）"
+                )
+                return True
+            self.last_move_error = ""
+            return True
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     async def delete_file(self, group_id: str, file_id: str) -> bool:
         try:
@@ -309,7 +355,8 @@ class OneBotFileBackend(FileBackend):
                 "delete_group_file", group_id=int(group_id), file_id=file_id
             )
             return self._action_ok(data)
-        except RuntimeError:
+        except RuntimeError as e:
+            self.last_move_error = "delete_group_file 失败: " + str(e)
             return False
 
     async def download_file(self, group_id: str, file_id: str, dest_path: str) -> bool:
@@ -333,14 +380,28 @@ class OneBotFileBackend(FileBackend):
     async def upload_file(self, group_id: str, folder_id: str, local_path: str) -> Optional[str]:
         if not os.path.isfile(local_path):
             return None
+        common = {
+            "group_id": int(group_id),
+            "file": f"file://{os.path.abspath(local_path)}",
+            "name": os.path.basename(local_path),
+        }
+        if self._is_llbot:
+            # LLOneBot 只认 folder_id
+            params = {**common, "folder_id": folder_id or "/"}
+        else:
+            # NapCat 同时兼容 folder / folder_id，大文件需延长超时
+            params = {
+                **common,
+                "folder": folder_id or "/",
+                "folder_id": folder_id or "/",
+                "timeout": 300,
+            }
         try:
-            data = await self._call(
-                "upload_group_file",
-                group_id=int(group_id),
-                file=f"file://{os.path.abspath(local_path)}",
-                name=os.path.basename(local_path),
-                folder_id=folder_id or "/",
-            )
-            return (data or {}).get("file_id") or "uploaded"
-        except RuntimeError:
+            data = await self._call("upload_group_file", **params)
+        except RuntimeError as e:
+            self.last_move_error = "upload_group_file 调用失败: " + str(e)
             return None
+        if not self._action_ok(data):
+            self.last_move_error = "upload_group_file 响应判定失败: " + str(data)[:200]
+            return None
+        return (data or {}).get("file_id") or "uploaded"

@@ -67,7 +67,7 @@ class FileHandlers:
     # ---------- 帮助 ----------
     async def handle_help(self, event: AstrMessageEvent):
         text = (
-            "📂 QQ群聊文件管理 v1.0.4 指令\n"
+            "📂 QQ群聊文件管理 v1.0.5 指令\n"
             "━━━━━━━━━━━━━━━━\n"
             "  群文件列表 [文件夹]\n"
             "    └─ 查看群文件系统的文件/文件夹\n"
@@ -76,10 +76,12 @@ class FileHandlers:
             "    └─ 默认试运行(只报告)；真正执行请发：文件归类 --force（或「文件归类 强制」）\n"
             "    └─ 只处理某一类：文件归类 图片 --force\n"
             "    └─ 未知扩展名统一归入「其他」，可在 config/categories.json 自定义\n"
+            "    └─ 协议端不支持直接移动时，自动改用「下载→重新上传→删原文件」\n"
             "  清理失效文件 [--force]\n"
             "    └─ 扫描并清理无法下载的失效文件（已永久保存的可安全删除）\n"
             "    └─ 默认试运行；真正删除请发：清理失效文件 --force\n"
-            "  永久保存 <文件名或ID>\n"
+            "  永久保存 <文件名或ID>（必须带文件名，不能只发指令）\n"
+            "    └─ 例：永久保存 恒河两岸花.rwmod（含空格的文件名请完整照抄）\n"
             "    └─ 把群文件下载到本地永久存档（即使群文件失效也不丢）\n"
             "    └─ 可配置回传到群「永久保存」目录做双保险\n"
             "  永久文件列表\n"
@@ -148,8 +150,17 @@ class FileHandlers:
             lines.append("没有需要归类的文件（根目录已整洁）。")
         if r["skipped"]:
             lines.append(f"跳过(已归类) {len(r['skipped'])} 个")
+        if r.get("fallback_used"):
+            lines.append(
+                f"ℹ️ 其中 {r['fallback_used']} 个经「下载→重新上传」完成（协议端不支持直接移动）"
+            )
+        for w in (r.get("warnings") or [])[:3]:
+            lines.append("⚠️ " + str(w)[:200])
         if r["errors"]:
-            lines.append("⚠️ 错误: " + "; ".join(e["reason"] for e in r["errors"]))
+            reasons = list(dict.fromkeys(e["reason"] for e in r["errors"]))
+            lines.append(f"⚠️ 失败 {len(r['errors'])} 个：" + "、".join(reasons))
+            if r.get("error_detail"):
+                lines.append("原因：" + str(r["error_detail"])[:300])
         lines.append("（加 --force 可真正执行移动）" if dry_run else "归类完成。")
         yield event.plain_result("\n".join(lines))
 
@@ -246,6 +257,7 @@ class FileHandlers:
             "ENABLE_AUTO_CLEAN",
             "AUTO_MAINTENANCE_INTERVAL",
             "DRY_RUN_DEFAULT",
+            "ENABLE_MOVE_FALLBACK",
             "ENABLE_PERMANENT_UPLOAD",
             "PERMANENT_UPLOAD_FOLDER",
             "MAX_PERMANENT_SIZE_MB",

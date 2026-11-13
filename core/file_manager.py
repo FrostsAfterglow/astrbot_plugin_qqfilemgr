@@ -80,6 +80,9 @@ class FileManager:
             "moved": [],
             "skipped": [],
             "errors": [],
+            "fallback_used": 0,
+            "error_detail": "",
+            "warnings": [],
         }
         root_files = await self.backend.list_files(group_id, "")
         root_folders = {f.name: f for f in await self.backend.list_folders(group_id, "")}
@@ -120,10 +123,29 @@ class FileManager:
                 continue
 
             ok = await self.backend.move_file(group_id, node.id, folder_node.id)
+            used_fallback = False
+            if (
+                not ok
+                and self.config.get("ENABLE_MOVE_FALLBACK", True)
+                and hasattr(self.backend, "relocate_by_reupload")
+            ):
+                # 协议端不支持 move_group_file 时，走「下载→上传→删除」兜底
+                ok = await self.backend.relocate_by_reupload(group_id, node, folder_node.id)
+                used_fallback = bool(ok)
             if ok:
                 report["moved"].append({"name": node.name, "category": cat})
+                if used_fallback:
+                    report["fallback_used"] += 1
+                    # 兜底里「上传成功但删除源失败」会留警告，需透传给用户
+                    warn = str(getattr(self.backend, "last_move_error", "") or "")
+                    if warn and warn not in report["warnings"]:
+                        report["warnings"].append(warn)
             else:
                 report["errors"].append({"name": node.name, "reason": "移动失败"})
+                if not report["error_detail"]:
+                    report["error_detail"] = str(
+                        getattr(self.backend, "last_move_error", "") or "协议端未返回具体原因"
+                    )
 
         return report
 
