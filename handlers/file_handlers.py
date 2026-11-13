@@ -67,7 +67,7 @@ class FileHandlers:
     # ---------- 帮助 ----------
     async def handle_help(self, event: AstrMessageEvent):
         text = (
-            "📂 QQ群聊文件管理 v1.0.5 指令\n"
+            "📂 QQ群聊文件管理 v1.0.6 指令\n"
             "━━━━━━━━━━━━━━━━\n"
             "  群文件列表 [文件夹]\n"
             "    └─ 查看群文件系统的文件/文件夹\n"
@@ -90,6 +90,7 @@ class FileHandlers:
             "    └─ 查看当前插件配置\n"
             "  群文件诊断\n"
             "    └─ 检查 bot 绑定、协议端类型、能否读取真实群文件\n"
+            "    └─ 实测「取下载链接」是否可用（自动携带 busid、适配多协议端参数）\n"
             "━━━━━━━━━━━━━━━━\n"
             "安全提示：归类/清理默认试运行，确认无误后加 --force 执行。\n"
             "后端：auto 优先用 event.bot 操作真实群文件；未接适配器时自动降级本地镜像。"
@@ -142,12 +143,24 @@ class FileHandlers:
         lines = [f"🗂️ 文件归类 {mode}（群 {gid}）"]
         if r["created_folders"]:
             lines.append("新建分类目录: " + ", ".join(r["created_folders"]))
-        if r["moved"]:
-            lines.append(f"将移动 {len(r['moved'])} 个文件：")
-            for m in r["moved"]:
-                lines.append(f"  → {m['name']}  ⇒  {m['category']}")
+        err_cnt = len(r["errors"])
+        if dry_run:
+            if r["moved"]:
+                lines.append(f"将移动 {len(r['moved'])} 个文件：")
+                for m in r["moved"]:
+                    lines.append(f"  → {m['name']}  ⇒  {m['category']}")
+            else:
+                lines.append("没有需要归类的文件（根目录已整洁）。")
         else:
-            lines.append("没有需要归类的文件（根目录已整洁）。")
+            # 已执行：moved=成功，errors=失败；二者都空才算「根目录已整洁」
+            if r["moved"]:
+                lines.append(f"成功移动 {len(r['moved'])} 个文件：")
+                for m in r["moved"]:
+                    lines.append(f"  → {m['name']}  ⇒  {m['category']}")
+            if not r["moved"] and not err_cnt:
+                lines.append("没有需要归类的文件（根目录已整洁）。")
+            elif not r["moved"] and err_cnt:
+                lines.append(f"尝试归类 {err_cnt} 个文件，全部失败（原因见下）。")
         if r["skipped"]:
             lines.append(f"跳过(已归类) {len(r['skipped'])} 个")
         if r.get("fallback_used"):

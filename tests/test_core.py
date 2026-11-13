@@ -600,8 +600,13 @@ class TestMoveFallback(unittest.TestCase):
         run(be.ensure_ready())
         self.assertFalse(run(be.move_file("100", "F1", "D1")))
         self.assertIn("move_group_file", be.last_move_error)
-        moves = [a for a, _ in bot.api.calls if a == "move_group_file"]
-        self.assertEqual(len(moves), 2, "应依次尝试两种参数风格")
+        moves = [kw for a, kw in bot.api.calls if a == "move_group_file"]
+        # 三套目录参数方言都要尝试到（NapCat / target_dir / Lagrange）
+        self.assertGreaterEqual(len(moves), 3, "应依次尝试多种参数方言")
+        keys = {k for m in moves for k in m}
+        self.assertTrue(
+            {"current_parent_directory", "target_dir", "parent_directory"} & keys
+        )
 
     def test_relocate_success_order(self):
         be = _RelocateBackend()
@@ -721,6 +726,228 @@ class TestRelocateIntegration(unittest.TestCase):
         self.assertLess(actions.index("upload_group_file"),
                         actions.index("delete_group_file"),
                         "必须先确认上传成功再删除源文件")
+
+
+class _BusidStrictAPI(_FakeAPI):
+    """模拟 QQNT/NapCat：get_group_file_url / delete_group_file 缺 busid 就报 1400。"""
+
+    async def call_action(self, action, **kw):
+        self.calls.append((action, kw))
+        if action == "get_version_info":
+            return {"app_name": "NapCat"}
+        if action in ("get_group_root_files", "get_group_files_by_folder"):
+            return {
+                "files": [
+                    {"file_id": "F1", "file_name": "a.mp3", "file_size": 100, "busid": 7},
+                ],
+                "folders": [],
+            }
+        if action == "get_group_file_url":
+            if "busid" not in kw:
+                raise RuntimeError(
+                    "ActionFailed status='failed', retcode=1400, "
+                    "message='Schema compilation error: Expected required property'"
+                )
+            return {"url": "http://dl/a.mp3"}
+        if action == "delete_group_file":
+            if "busid" not in kw:
+                raise RuntimeError("ActionFailed retcode=1400 Expected required property")
+            return {"status": "ok", "retcode": 0}
+        return {"status": "ok", "retcode": 0}
+
+
+class _DialectAPI(_FakeAPI):
+    """模拟移动：只有 target_dir 方言成功，其余方言报 1400。"""
+
+    async def call_action(self, action, **kw):
+        self.calls.append((action, kw))
+        if action == "get_version_info":
+            return {"app_name": "NapCat"}
+        if action in ("get_group_root_files", "get_group_files_by_folder"):
+            return {
+                "files": [{"file_id": "F1", "file_name": "a.mp3", "busid": 7}],
+                "folders": [],
+            }
+        if action == "move_group_file":
+            if "target_dir" in kw and "current_parent_directory" not in kw:
+                return {"status": "ok", "retcode": 0}
+            raise RuntimeError("ActionFailed retcode=1400 Expected required property")
+        return {"status": "ok", "retcode": 0}
+
+
+class TestBusidAndDialects(unittest.TestCase):
+    """本轮核心修复：busid 自动携带 + 多方言重试 + 真实错误透传。"""
+
+    def _bound(self, api_cls):
+        bot = _FakeBot()
+        bot.api = api_cls()
+        be = OneBotFileBackend(_Ctx(), platform="aiocqhttp")
+        be.bind_event(_FakeEvent(bot))
+        run(be.ensure_ready())
+        return be, bot
+
+    def test_list_files_caches_busid(self):
+        be, _ = self._bound(_BusidStrictAPI)
+        run(be.list_files("100", ""))
+        self.assertEqual(be._busid_of("F1"), 7, "列目录应缓存 file_id->busid")
+
+    def test_get_file_url_sends_busid_after_list(self):
+        be, bot = self._bound(_BusidStrictAPI)
+        run(be.list_files("100", ""))   # 先列目录，填充 busid 缓存
+        url = run(be.get_file_url("100", "F1"))
+        self.assertEqual(url, "http://dl/a.mp3")
+        url_calls = [kw for a, kw in bot.api.calls if a == "get_group_file_url"]
+        self.assertEqual(url_calls[0].get("busid"), 7, "首个变体应带 busid")
+
+    def test_get_file_url_fallback_when_no_busid_cached(self):
+        # 未列目录时 busid 未知：先不带 busid（会 1400），再无其它变体 -> 失败且记录真实原因
+        be, bot = self._bound(_BusidStrictAPI)
+        url = run(be.get_file_url("100", "F1"))
+        self.assertIsNone(url)
+        self.assertIn("1400", be.last_url_error, "应透传协议端真实错误")
+
+    def test_delete_file_sends_busid(self):
+        be, bot = self._bound(_BusidStrictAPI)
+        run(be.list_files("100", ""))
+        self.assertTrue(run(be.delete_file("100", "F1")))
+        dels = [kw for a, kw in bot.api.calls if a == "delete_group_file"]
+        self.assertEqual(dels[0].get("busid"), 7)
+
+    def test_move_falls_back_to_target_dir_dialect(self):
+        be, bot = self._bound(_DialectAPI)
+        run(be.list_files("100", ""))
+        self.assertTrue(run(be.move_file("100", "F1", "D1")), "应命中 target_dir 方言成功")
+        moves = [kw for a, kw in bot.api.calls if a == "move_group_file"]
+        self.assertTrue(any("target_dir" in m for m in moves))
+        self.assertEqual(be.last_move_error, "", "成功后应清空错误")
+
+    def test_probe_reports_file_url_ok(self):
+        be, _ = self._bound(_BusidStrictAPI)
+        info = run(be.probe("100"))
+        self.assertTrue(info["probe"]["root_files"] >= 1)
+        self.assertTrue(info["probe"]["file_url_ok"], "诊断应实测出下载链接可用")
+        self.assertEqual(info["probe"]["sample_busid"], 7)
+
+    def test_download_records_real_url_error(self):
+        be, _ = self._bound(_BusidStrictAPI)
+        # 直接下载未缓存 busid 的文件 -> 取链接 1400 -> 下载失败且错误可查
+        dest = os.path.join(tempfile.mkdtemp(), "a.mp3")
+        self.assertFalse(run(be.download_file("100", "F1", dest)))
+        self.assertIn("取下载链接失败", be.last_download_error)
+        self.assertIn("1400", be.last_download_error)
+
+
+class _FailReceiptManager(_RecordingManager):
+    async def classify(self, gid, dry_run=True, target_category=None):
+        return {"created_folders": ["音频"], "moved": [], "skipped": [],
+                "errors": [{"name": "a.mp3", "reason": "移动失败"}],
+                "fallback_used": 0, "error_detail": "兜底失败", "warnings": []}
+
+
+class TestClassifyReceiptNoContradiction(unittest.TestCase):
+    def test_executed_all_failed_not_say_tidy(self):
+        h = _handler(_FailReceiptManager())
+        ev = _HandlerEvent("文件归类 --force")
+        out = _collect(h.handle_classify(ev))
+        text = out[0][1]
+        self.assertNotIn("根目录已整洁", text, "有失败项时不能说根目录已整洁")
+        self.assertIn("全部失败", text)
+
+
+class _QQNTStrictAPI(_FakeAPI):
+    """复刻用户真实协议端：move 全报 1400；取链接/删除必须带 busid，否则 1400。"""
+
+    def __init__(self, url):
+        self.app_name = "NapCat"
+        self.wrap = False
+        self.url = url
+        self.calls = []
+
+    async def call_action(self, action, **kw):
+        self.calls.append((action, kw))
+        if action == "get_version_info":
+            return {"app_name": self.app_name}
+        if action in ("get_group_root_files", "get_group_files_by_folder"):
+            return {
+                "files": [{"file_id": "F1", "file_name": "a.mp3",
+                           "file_size": 12, "busid": 7}],
+                "folders": [],
+            }
+        if action == "move_group_file":
+            raise RuntimeError(
+                "ActionFailed retcode=1400 Schema compilation error: Expected required property"
+            )
+        if action == "get_group_file_url":
+            if "busid" not in kw:
+                raise RuntimeError("ActionFailed retcode=1400 Expected required property")
+            return {"url": self.url}
+        if action == "upload_group_file":
+            return {"status": "ok", "retcode": 0, "file_id": "NEW"}
+        if action == "delete_group_file":
+            if "busid" not in kw:
+                raise RuntimeError("ActionFailed retcode=1400 Expected required property")
+            return {"status": "ok", "retcode": 0}
+        return {"status": "ok", "retcode": 0}
+
+
+class TestQQNTFullFallback(unittest.TestCase):
+    """端到端复刻用户报错场景，验证 v1.0.6 修复后兜底链真能跑通。"""
+
+    def test_full_reupload_chain_with_busid_and_real_download(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                body = b"PAYLOAD-DATA"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):  # 静音
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            url = f"http://127.0.0.1:{port}/a.mp3"
+            bot = _FakeBot()
+            bot.api = _QQNTStrictAPI(url)
+            be = OneBotFileBackend(_Ctx(), platform="aiocqhttp")
+            be.bind_event(_FakeEvent(bot))
+            run(be.ensure_ready())
+
+            # 1) 列目录 -> 缓存 busid=7
+            run(be.list_files("100", ""))
+            self.assertEqual(be._busid_of("F1"), 7)
+
+            # 2) move 全部失败并透传真实原因
+            self.assertFalse(run(be.move_file("100", "F1", "D1")))
+            self.assertIn("1400", be.last_move_error)
+
+            # 3) 兜底：下载(带busid取链接) -> 上传 -> 删除(带busid)
+            node = FileNode(id="F1", name="a.mp3", size=12, busid=7)
+            self.assertTrue(
+                run(be.relocate_by_reupload("100", node, "D1")),
+                "带 busid 后整条兜底链应成功",
+            )
+            actions = [a for a, _ in bot.api.calls]
+            self.assertIn("get_group_file_url", actions)
+            self.assertIn("upload_group_file", actions)
+            self.assertIn("delete_group_file", actions)
+            url_calls = [kw for a, kw in bot.api.calls if a == "get_group_file_url"]
+            self.assertTrue(any(kw.get("busid") == 7 for kw in url_calls))
+            del_calls = [kw for a, kw in bot.api.calls if a == "delete_group_file"]
+            self.assertTrue(any(kw.get("busid") == 7 for kw in del_calls))
+            # 上传必须先于删除（确认成功才删源）
+            self.assertLess(actions.index("upload_group_file"),
+                            actions.index("delete_group_file"))
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

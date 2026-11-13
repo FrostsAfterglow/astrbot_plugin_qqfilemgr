@@ -39,7 +39,7 @@ CMD_DIAG = "群文件诊断"
     "astrbot_plugin_qqfilemgr",
     "FrostsAfterglow",
     "QQ群聊文件管理：自动归类 / 失效清理 / 永久保存",
-    "1.0.5",
+    "1.0.6",
     "https://github.com/FrostsAfterglow/astrbot_plugin_qqfilemgr",
 )
 class QQFileManagerPlugin(Star):
@@ -243,6 +243,9 @@ class QQFileManagerPlugin(Star):
                          + ("（LLOneBot 参数）" if info.get("is_llbot") else ""))
             last_err = str(getattr(self._onebot, "last_move_error", "") or "")
             lines.append("上次移动错误: " + (last_err[:220] or "(暂无记录)"))
+            url_err = str(getattr(self._onebot, "last_url_error", "") or "")
+            lines.append("上次取链接错误: " + (url_err[:220] or "(暂无记录)"))
+            lines.append(f"已缓存 busid 的文件数: {info.get('busid_known', 0)}")
             lines.append(f"context 接口: get_platform={info.get('has_get_platform')} "
                          f"get_platform_adapter={info.get('has_get_platform_adapter')}")
             probe = info.get("probe", {}) or {}
@@ -258,10 +261,21 @@ class QQFileManagerPlugin(Star):
                     lines.append("示例: " + ", ".join(str(x) for x in probe["sample"]))
             if "list_error" in probe:
                 lines.append("列目录失败: " + str(probe["list_error"])[:100])
+            if "sample_busid" in probe:
+                lines.append(f"样本文件 busid: {probe.get('sample_busid')}")
+            if "file_url_ok" in probe:
+                mark = "✅ 可取下载链接" if probe["file_url_ok"] else "❌ 取下载链接失败"
+                lines.append(mark)
+                if probe.get("file_url_error"):
+                    lines.append("  原因: " + str(probe["file_url_error"])[:220])
             if "error" in probe:
                 lines.append("探测: " + str(probe["error"]))
             if info.get("bound") and "root_files" in probe:
-                lines.append("✅ 后端可用，归类/清理/永久保存可直接操作真实群文件。")
+                if probe.get("file_url_ok"):
+                    lines.append("✅ 后端可用，归类/清理/永久保存可直接操作真实群文件。")
+                else:
+                    lines.append("⚠️ 能列目录但取不到下载链接：多为协议端要求 busid 或该 action 参数方言不同，")
+                    lines.append("   请把上面「取链接错误」发我，或先把 BACKEND 设为 local 试用。")
             else:
                 lines.append("如未绑定：请确认已接入 aiocqhttp 适配器并在线；")
                 lines.append("或把 BACKEND 设为 local 使用离线镜像。")
